@@ -85,10 +85,20 @@ class TerminalManager {
             return true;
         });
 
-        // Right-click paste
+        // Right-click paste: focus terminal textarea so the browser paste event fires
         this.terminal.element.addEventListener('contextmenu', (e) => {
             e.preventDefault();
-            this.pasteFromClipboard();
+            if (this.terminal.textarea) {
+                this.terminal.textarea.focus();
+                document.execCommand('paste');
+            }
+        });
+
+        // Handle paste from any source (Ctrl+V, context menu, etc.)
+        this.terminal.element.addEventListener('paste', (e) => {
+            e.preventDefault();
+            const text = (e.clipboardData || window.clipboardData).getData('text');
+            if (text) this.sendText(text);
         });
 
         // Window resize
