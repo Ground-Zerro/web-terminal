@@ -76,40 +76,27 @@ class TerminalManager {
             }
         });
 
-        // Ctrl+Shift+V paste
+        // Ctrl+Shift+V — let browser handle paste natively (paste event on textarea catches it)
         this.terminal.attachCustomKeyEventHandler((event) => {
             if (event.ctrlKey && event.shiftKey && event.key === 'V') {
-                if (event.type === 'keydown') this.pasteFromClipboard();
-                return false;
+                return false; // let browser fire paste event on textarea
             }
             return true;
         });
 
-        // Right-click paste: capture clipboard on mousedown (before contextmenu)
-        // Clipboard API works reliably from mousedown but not from contextmenu
-        this.terminal.element.addEventListener('mousedown', (e) => {
-            if (e.button === 2) {
-                this._pendingPaste = navigator.clipboard.readText().catch(() => null);
-            }
-        });
-
-        this.terminal.element.addEventListener('contextmenu', (e) => {
-            e.preventDefault();
-            if (this._pendingPaste) {
-                this._pendingPaste.then(text => {
-                    if (text) this.sendText(text);
-                    this._pendingPaste = null;
-                });
-            }
-        });
-
-        // Handle paste from Ctrl+V / browser paste menu
-        this.terminal.element.addEventListener('paste', (e) => {
+        // Handle paste from Ctrl+V / browser context menu "Paste"
+        // Uses DOM paste event (works on HTTP, not Clipboard API)
+        this.terminal.textarea.addEventListener('paste', (e) => {
+            e.stopPropagation();
             const text = (e.clipboardData || window.clipboardData).getData('text');
-            if (text) {
-                e.preventDefault();
-                this.sendText(text);
-            }
+            if (text) this.sendText(text);
+        });
+
+        // Right-click: show context menu (browser "Paste" option triggers paste event above)
+        // Clipboard API is blocked on HTTP pages, so we can't read clipboard from JS directly.
+        // The browser's native "Paste" menu item fires a paste DOM event with clipboardData.
+        this.terminal.element.addEventListener('contextmenu', (e) => {
+            // Allow native context menu so user can click "Paste"
         });
 
         // Window resize
