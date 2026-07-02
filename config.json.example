@@ -1,7 +1,7 @@
 {
     "listen_addr": "127.0.0.1:8081",
-    "login": "YOUR_LOGIN",
-    "password": "YOUR_PASSWORD",
+    "login": "admin",
+    "password": "root",
     "work_dir": "/root/terminal",
     "terminal_dir": "/root",
     "fail2ban_log": "/var/log/webterminal-bruteforce.log",
