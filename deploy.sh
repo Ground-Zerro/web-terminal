@@ -38,37 +38,22 @@ else
     echo "  Installed: $(go version)"
 fi
 
-# 4. Clone or update repository
+# 4. Clone fresh from repository
 echo "[4/10] Getting source code..."
-if [ -f "$INSTALL_DIR/main.go" ]; then
+rm -rf "$INSTALL_DIR"
+if git clone -q "$REPO_URL" "$INSTALL_DIR" 2>/dev/null; then
     cd "$INSTALL_DIR"
-    if [ -d ".git" ]; then
-        git pull -q 2>/dev/null || echo "  WARNING: git pull failed, using local source"
-        echo "  Source ready"
-    else
-        echo "  Source present (manual copy)"
-    fi
+    echo "  Cloned from GitHub"
 else
-    rm -rf "$INSTALL_DIR"
-    if git clone -q "$REPO_URL" "$INSTALL_DIR" 2>/dev/null; then
-        cd "$INSTALL_DIR"
-        echo "  Cloned from GitHub"
-    else
-        echo "  ERROR: Cannot get source code."
-        echo "  For private repos, copy source to $INSTALL_DIR first, then re-run."
-        exit 1
-    fi
+    echo "  ERROR: Cannot get source code."
+    echo "  For private repos, copy source to $INSTALL_DIR first, then re-run."
+    exit 1
 fi
 
 # 5. Initialize Go module
 echo "[5/10] Initializing Go module..."
-if [ ! -f go.mod ]; then
-    /usr/local/go/bin/go mod init webterminal || echo "  WARNING: go mod init failed"
-    /usr/local/go/bin/go mod tidy || echo "  WARNING: go mod tidy failed"
-    echo "  Module initialized"
-else
-    echo "  go.mod exists, skipping init"
-fi
+/usr/local/go/bin/go mod init webterminal || echo "  WARNING: go mod init failed"
+/usr/local/go/bin/go mod tidy || echo "  WARNING: go mod tidy failed"
 
 # 6. Build
 echo "[6/10] Building binary..."

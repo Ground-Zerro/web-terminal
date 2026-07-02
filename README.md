@@ -242,6 +242,23 @@ systemctl restart webterminal
 kill $(pgrep -f webterminal) && sleep 1 && nohup ./webterminal > /var/log/webterminal.log 2>&1 &
 ```
 
+### Uninstall
+
+One-liner to remove everything deployed by `deploy.sh`:
+
+```bash
+curl -sL https://raw.githubusercontent.com/Ground-Zerro/web-terminal/main/destroy.sh | bash
+```
+
+The script will ask for confirmation, then remove:
+- webterminal systemd service
+- nginx config for `/web/`
+- project files (`/root/terminal`)
+- logs (`/var/log/webterminal*`)
+- Go (only if installed by deploy.sh)
+
+System packages (git, nginx, curl, build-essential) are **not** removed.
+
 ### License
 
 MIT
@@ -485,6 +502,23 @@ systemctl restart webterminal
 # Мягкий деплой без разрыва сессий
 kill $(pgrep -f webterminal) && sleep 1 && nohup ./webterminal > /var/log/webterminal.log 2>&1 &
 ```
+
+### Удаление
+
+Однострочная команда для удаления всего, что установил `deploy.sh`:
+
+```bash
+curl -sL https://raw.githubusercontent.com/Ground-Zerro/web-terminal/main/destroy.sh | bash
+```
+
+Скрипт запросит подтверждение и удалит:
+- systemd-сервис webterminal
+- конфигурацию nginx для `/web/`
+- файлы проекта (`/root/terminal`)
+- логи (`/var/log/webterminal*`)
+- Go (только если был установлен deploy.sh)
+
+Системные пакеты (git, nginx, curl, build-essential) **не удаляются**.
 
 ### Лицензия
 
