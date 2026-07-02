@@ -85,20 +85,31 @@ class TerminalManager {
             return true;
         });
 
-        // Right-click paste: focus terminal textarea so the browser paste event fires
-        this.terminal.element.addEventListener('contextmenu', (e) => {
-            e.preventDefault();
-            if (this.terminal.textarea) {
-                this.terminal.textarea.focus();
-                document.execCommand('paste');
+        // Right-click paste: capture clipboard on mousedown (before contextmenu)
+        // Clipboard API works reliably from mousedown but not from contextmenu
+        this.terminal.element.addEventListener('mousedown', (e) => {
+            if (e.button === 2) {
+                this._pendingPaste = navigator.clipboard.readText().catch(() => null);
             }
         });
 
-        // Handle paste from any source (Ctrl+V, context menu, etc.)
-        this.terminal.element.addEventListener('paste', (e) => {
+        this.terminal.element.addEventListener('contextmenu', (e) => {
             e.preventDefault();
+            if (this._pendingPaste) {
+                this._pendingPaste.then(text => {
+                    if (text) this.sendText(text);
+                    this._pendingPaste = null;
+                });
+            }
+        });
+
+        // Handle paste from Ctrl+V / browser paste menu
+        this.terminal.element.addEventListener('paste', (e) => {
             const text = (e.clipboardData || window.clipboardData).getData('text');
-            if (text) this.sendText(text);
+            if (text) {
+                e.preventDefault();
+                this.sendText(text);
+            }
         });
 
         // Window resize
