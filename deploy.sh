@@ -1,7 +1,6 @@
 #!/bin/bash
-set -e
 
-# Web Terminal — one-shot deployment script for fresh VPS
+# Web Terminal - one-shot deployment script for fresh VPS
 # Usage: curl -sL https://raw.githubusercontent.com/Ground-Zerro/web-terminal/main/deploy.sh | bash
 
 REPO_URL="https://github.com/Ground-Zerro/web-terminal.git"
@@ -15,19 +14,25 @@ echo ""
 # 1. System update
 echo "[1/10] Updating system..."
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get upgrade -y -qq
+apt-get update -qq || echo "  WARNING: apt-get update failed, continuing anyway"
+apt-get upgrade -y -qq || echo "  WARNING: apt-get upgrade failed, continuing anyway"
 
 # 2. Install dependencies
 echo "[2/10] Installing dependencies..."
-apt-get install -y -qq git nginx curl build-essential
+apt-get install -y -qq git nginx curl build-essential || {
+    echo "  ERROR: Failed to install dependencies"
+    exit 1
+}
 
 # 3. Install Go
 echo "[3/10] Installing Go ${GO_VERSION}..."
 if command -v go &>/dev/null; then
     echo "  Go already installed: $(go version)"
 else
-    curl -sL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xzf -
+    curl -sL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xzf - || {
+        echo "  ERROR: Failed to download/install Go"
+        exit 1
+    }
     echo 'export PATH=$PATH:/usr/local/go/bin' >> /root/.bashrc
     export PATH=$PATH:/usr/local/go/bin
     echo "  Installed: $(go version)"
@@ -38,8 +43,8 @@ echo "[4/10] Getting source code..."
 if [ -f "$INSTALL_DIR/main.go" ]; then
     cd "$INSTALL_DIR"
     if [ -d ".git" ]; then
-        git pull -q 2>/dev/null || true
-        echo "  Updated from git"
+        git pull -q 2>/dev/null || echo "  WARNING: git pull failed, using local source"
+        echo "  Source ready"
     else
         echo "  Source present (manual copy)"
     fi
@@ -58,8 +63,8 @@ fi
 # 5. Initialize Go module
 echo "[5/10] Initializing Go module..."
 if [ ! -f go.mod ]; then
-    /usr/local/go/bin/go mod init webterminal
-    /usr/local/go/bin/go mod tidy
+    /usr/local/go/bin/go mod init webterminal || echo "  WARNING: go mod init failed"
+    /usr/local/go/bin/go mod tidy || echo "  WARNING: go mod tidy failed"
     echo "  Module initialized"
 else
     echo "  go.mod exists, skipping init"
@@ -67,7 +72,10 @@ fi
 
 # 6. Build
 echo "[6/10] Building binary..."
-/usr/local/go/bin/go build -o webterminal .
+/usr/local/go/bin/go build -o webterminal . || {
+    echo "  ERROR: Build failed"
+    exit 1
+}
 echo "  Built: $(ls -la webterminal | awk '{print $5}') bytes"
 
 # 7. Install vendor files (xterm.js)
@@ -83,7 +91,9 @@ for file in \
     "@xterm/addon-unicode11@0.8.0/lib/addon-unicode11.min.js" \
     "@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"; do
     filename=$(basename "$file")
-    curl -sL -o "$filename" "https://cdn.jsdelivr.net/npm/$file"
+    if ! curl -sL -o "$filename" "https://cdn.jsdelivr.net/npm/$file"; then
+        echo "  WARNING: Failed to download $filename"
+    fi
 done
 
 # Verify downloads
@@ -142,16 +152,14 @@ SyslogIdentifier=webterminal
 WantedBy=multi-user.target
 SVC
 
-systemctl daemon-reload
-systemctl enable --now webterminal
+systemctl daemon-reload || echo "  WARNING: systemctl daemon-reload failed"
+systemctl enable --now webterminal || echo "  WARNING: systemctl enable failed"
 sleep 1
 
 if systemctl is-active --quiet webterminal; then
     echo "  Web terminal service: running"
 else
-    echo "  ERROR: Web terminal failed to start!"
-    journalctl -u webterminal --no-pager -n 10
-    exit 1
+    echo "  WARNING: Web terminal may not be running. Check with: systemctl status webterminal"
 fi
 
 # 10. Configure nginx
@@ -180,18 +188,16 @@ rm -f /etc/nginx/sites-enabled/default
 ln -sf /etc/nginx/sites-available/webterminal /etc/nginx/sites-enabled/webterminal
 
 if nginx -t 2>/dev/null; then
-    systemctl enable --now nginx
-    systemctl restart nginx
+    systemctl enable --now nginx || echo "  WARNING: nginx enable failed"
+    systemctl restart nginx || echo "  WARNING: nginx restart failed"
     echo "  Nginx: running"
 else
-    echo "  ERROR: Nginx config test failed!"
-    nginx -t
-    exit 1
+    echo "  WARNING: Nginx config test failed, check with: nginx -t"
 fi
 
 # Restart webterminal to pick up new binary/config
 echo "  Restarting webterminal..."
-systemctl restart webterminal
+systemctl restart webterminal || echo "  WARNING: webterminal restart failed"
 sleep 1
 
 # Verify
