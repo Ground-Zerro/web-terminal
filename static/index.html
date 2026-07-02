@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web Terminal</title>
+    <link rel="stylesheet" href="static/css/style.css">
+    <link rel="stylesheet" href="static/vendor/xterm.min.css">
+</head>
+<body>
+    <!-- Login Screen -->
+    <div id="login-screen" class="login-screen">
+        <div class="login-container">
+            <h1>Web Terminal</h1>
+            <form id="login-form">
+                <div class="form-group">
+                    <label for="login">Login</label>
+                    <input type="text" id="login" name="login" required autocomplete="username">
+                </div>
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" required autocomplete="current-password">
+                </div>
+                <button type="submit">Login</button>
+                <div id="login-error" class="error-message" style="display: none;"></div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Main Application -->
+    <div id="app" class="app" style="display: none;">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-left">
+                <h2>Web Terminal</h2>
+            </div>
+            <div class="header-center" id="perf-widget">
+                <div class="perf-cpu">
+                    <canvas id="cpu-graph" width="120" height="30"></canvas>
+                    <span id="cpu-text">CPU --%</span>
+                </div>
+                <div class="perf-mem">
+                    <span id="mem-text">MEM --/--</span>
+                </div>
+                <div class="perf-net">
+                    <span id="net-text">&darr;-- &uarr;--</span>
+                </div>
+            </div>
+            <div class="header-right">
+                <span id="user-info">admin</span>
+                <button id="logout-btn" class="btn-logout">Logout</button>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <div class="main-content">
+            <!-- File Browser -->
+            <div class="file-browser">
+                <div class="file-browser-header">
+                    <h3>Files</h3>
+                    <div class="file-browser-actions">
+                        <button id="refresh-files" class="btn-icon" title="Refresh">↻</button>
+                        <button id="new-folder" class="btn-icon" title="New Folder">📁+</button>
+                    </div>
+                </div>
+                <div class="file-browser-sort">
+                    <button id="sort-name" class="sort-btn active asc" title="Sort by name">Name ↕</button>
+                    <button id="sort-size" class="sort-btn" title="Sort by size">Size ↕</button>
+                    <button id="sort-date" class="sort-btn" title="Sort by date">Date ↕</button>
+                </div>
+                <div class="file-browser-path">
+                    <input type="text" id="current-path" value="/" placeholder="Type path and press Enter">
+                    <div id="path-autocomplete" class="path-autocomplete"></div>
+                </div>
+                <div id="file-list" class="file-list">
+                </div>
+                <div class="file-browser-footer">
+                    <div id="upload-area" class="upload-area">
+                        <input type="file" id="file-input" style="display: none;" multiple>
+                        <label for="file-input" class="upload-label">
+                            Drop files here or click to upload
+                        </label>
+                        <div id="upload-progress" class="upload-progress">
+                            <div class="progress-bar-container">
+                                <div id="progress-bar" class="progress-bar"></div>
+                            </div>
+                            <div id="progress-text" class="progress-text"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Terminal -->
+            <div class="terminal-container">
+                <div class="terminal-header">
+                    <h3>Terminal</h3>
+                    <div class="terminal-actions">
+                        <button id="clear-terminal" class="btn-icon" title="Clear">🗑️</button>
+                    </div>
+                </div>
+                <div id="terminal"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="static/vendor/xterm.min.js"></script>
+    <script src="static/vendor/addon-fit.min.js"></script>
+    <script src="static/vendor/addon-unicode11.min.js"></script>
+    <script src="static/vendor/addon-web-links.min.js"></script>
+    <script src="static/js/terminal.js"></script>
+    <script src="static/js/perf.js"></script>
+    <script src="static/js/app.js"></script>
+</body>
+</html>
