@@ -8,56 +8,74 @@ INSTALL_DIR="/root/terminal"
 GO_VERSION="1.22.4"
 XTERM_VERSION="5.3.0"
 
+GO_BIN="/usr/local/go/bin/go"
+APT_OPTS=(-y -qq -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
+main() {
+
 echo "=== Web Terminal Deployment ==="
 echo ""
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: This script must be run as root"
+    exit 1
+fi
 
 # 1. System update
 echo "[1/10] Updating system..."
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq || echo "  WARNING: apt-get update failed, continuing anyway"
-apt-get upgrade -y -qq || echo "  WARNING: apt-get upgrade failed, continuing anyway"
+apt-get update -qq -o DPkg::Lock::Timeout=300 </dev/null || echo "  WARNING: apt-get update failed, continuing anyway"
+apt-get upgrade "${APT_OPTS[@]}" </dev/null || echo "  WARNING: apt-get upgrade failed, continuing anyway"
 
 # 2. Install dependencies
 echo "[2/10] Installing dependencies..."
-apt-get install -y -qq git nginx curl build-essential || {
+apt-get install "${APT_OPTS[@]}" git nginx curl ca-certificates build-essential </dev/null || {
     echo "  ERROR: Failed to install dependencies"
     exit 1
 }
 
 # 3. Install Go
 echo "[3/10] Installing Go ${GO_VERSION}..."
-if command -v go &>/dev/null; then
-    echo "  Go already installed: $(go version)"
+if [ -x "$GO_BIN" ]; then
+    echo "  Go already installed: $($GO_BIN version)"
 else
+    rm -rf /usr/local/go
     curl -sL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xzf - || {
         echo "  ERROR: Failed to download/install Go"
         exit 1
     }
-    echo 'export PATH=$PATH:/usr/local/go/bin' >> /root/.bashrc
-    export PATH=$PATH:/usr/local/go/bin
-    echo "  Installed: $(go version)"
+    grep -q '/usr/local/go/bin' /root/.bashrc 2>/dev/null || echo 'export PATH=$PATH:/usr/local/go/bin' >> /root/.bashrc
+    echo "  Installed: $($GO_BIN version)"
 fi
 
 # 4. Clone fresh from repository
 echo "[4/10] Getting source code..."
-rm -rf "$INSTALL_DIR"
-if git clone -q "$REPO_URL" "$INSTALL_DIR" 2>/dev/null; then
-    cd "$INSTALL_DIR"
+CLONE_TMP=$(mktemp -d)
+if git clone -q "$REPO_URL" "$CLONE_TMP/src" 2>/dev/null; then
+    rm -rf "$INSTALL_DIR"
+    mv "$CLONE_TMP/src" "$INSTALL_DIR"
     echo "  Cloned from GitHub"
+elif [ -f "$INSTALL_DIR/main.go" ]; then
+    echo "  Repository unavailable, using existing source in $INSTALL_DIR"
 else
+    rm -rf "$CLONE_TMP"
     echo "  ERROR: Cannot get source code."
     echo "  For private repos, copy source to $INSTALL_DIR first, then re-run."
     exit 1
 fi
+rm -rf "$CLONE_TMP"
+cd "$INSTALL_DIR"
 
-# 5. Initialize Go module
-echo "[5/10] Initializing Go module..."
-/usr/local/go/bin/go mod init webterminal || echo "  WARNING: go mod init failed"
-/usr/local/go/bin/go mod tidy || echo "  WARNING: go mod tidy failed"
+# 5. Download Go modules
+echo "[5/10] Downloading Go modules..."
+"$GO_BIN" mod download || {
+    echo "  ERROR: Failed to download Go modules"
+    exit 1
+}
 
 # 6. Build
 echo "[6/10] Building binary..."
-/usr/local/go/bin/go build -o webterminal . || {
+"$GO_BIN" build -o webterminal . || {
     echo "  ERROR: Build failed"
     exit 1
 }
@@ -83,6 +101,7 @@ done
 
 # Verify downloads
 TOTAL_SIZE=$(wc -c *.js *.css 2>/dev/null | tail -1 | awk '{print $1}')
+TOTAL_SIZE=${TOTAL_SIZE:-0}
 if [ "$TOTAL_SIZE" -lt 10000 ]; then
     echo "  WARNING: Vendor files may not have downloaded correctly (total: ${TOTAL_SIZE} bytes)"
 else
@@ -208,3 +227,7 @@ echo ""
 echo "  Service:  systemctl status webterminal"
 echo "  Logs:     journalctl -u webterminal -f"
 echo ""
+
+}
+
+main "$@"
