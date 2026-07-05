@@ -14,6 +14,9 @@ class TerminalManager {
     init(token) {
         this.token = token;
 
+        // Mobile modifier keys state (unused now, kept for compat)
+        this.lockedMods = { shift: false, ctrl: false, alt: false };
+
         // Persistent UTF-8 decoder — keeps state across WebSocket frames
         // so multi-byte chars split across frames are reassembled correctly
         this.decoder = new TextDecoder('utf-8');
@@ -81,15 +84,21 @@ class TerminalManager {
             if (event.ctrlKey && event.shiftKey && event.key === 'V') {
                 return false; // let browser fire paste event on textarea
             }
-            return true;
-        });
 
-        // Handle paste from Ctrl+V / browser context menu "Paste"
-        // Uses DOM paste event (works on HTTP, not Clipboard API)
-        this.terminal.textarea.addEventListener('paste', (e) => {
-            e.stopPropagation();
-            const text = (e.clipboardData || window.clipboardData).getData('text');
-            if (text) this.sendText(text);
+            // Apply locked modifiers from mobile toolbar
+            if (event.type === 'keydown' || event.type === 'keypress') {
+                if (this.lockedMods.ctrl && !event.ctrlKey) {
+                    event.preventDefault();
+                    this._sendWithMods(event.key, true, this.lockedMods.shift, this.lockedMods.alt);
+                    return false;
+                }
+                if (this.lockedMods.alt && !event.altKey) {
+                    event.preventDefault();
+                    this._sendWithMods(event.key, this.lockedMods.ctrl, this.lockedMods.shift, true);
+                    return false;
+                }
+            }
+            return true;
         });
 
         // Right-click: show context menu (browser "Paste" option triggers paste event above)
@@ -119,6 +128,7 @@ class TerminalManager {
         });
 
         this.connect();
+        this.setupMobileKeys();
     }
 
     _fitNow() {
@@ -130,6 +140,87 @@ class TerminalManager {
 
     _fitDelayed(ms) {
         setTimeout(() => this._fitNow(), ms);
+    }
+
+    _sendWithMods(key, ctrl, shift, alt) {
+        if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+        let code = '';
+        const k = key.length === 1 ? key.toLowerCase() : key;
+
+        if (ctrl) {
+            if (k >= 'a' && k <= 'z') {
+                code = String.fromCharCode(k.charCodeAt(0) - 96);
+            } else if (k === '[') code = '\x1b';
+            else if (k === '\\') code = '\x1c';
+            else if (k === ']') code = '\x1d';
+            else if (k === '^') code = '\x1e';
+            else if (k === '_') code = '\x1f';
+            else if (k === '?') code = '\x7f';
+            else code = key;
+        } else {
+            code = key;
+        }
+
+        if (alt) code = '\x1b' + code;
+        if (shift && !ctrl) code = key.length === 1 ? key : code;
+
+        this.socket.send(code);
+    }
+
+    setupMobileKeys() {
+        const keysBar = document.getElementById('terminal-keys');
+        if (!keysBar) return;
+
+        // Arrow key buttons
+        keysBar.querySelectorAll('.key-arrow').forEach(btn => {
+            const handler = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const dir = btn.dataset.arrow;
+                this.sendText('\x1b[' + dir);
+            };
+            btn.addEventListener('touchstart', handler, { passive: false });
+            btn.addEventListener('click', handler);
+        });
+
+        // Shortcuts dropdown
+        const toggle = document.getElementById('key-shortcuts-toggle');
+        const menu = document.getElementById('key-shortcuts-menu');
+        if (toggle && menu) {
+            const toggleHandler = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                menu.classList.toggle('open');
+            };
+            toggle.addEventListener('touchstart', toggleHandler, { passive: false });
+            toggle.addEventListener('click', toggleHandler);
+            document.addEventListener('touchstart', (e) => {
+                if (!e.target.closest('.key-shortcuts-wrap')) menu.classList.remove('open');
+            });
+            document.addEventListener('click', () => menu.classList.remove('open'));
+        }
+
+        // Shortcut buttons
+        keysBar.querySelectorAll('.key-shortcut').forEach(btn => {
+            const handler = (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const seq = btn.dataset.seq;
+                const useCtrl = btn.dataset.ctrl === '1';
+                if (useCtrl) {
+                    this._sendWithMods(seq, true, false, false);
+                } else if (seq === 'enter') {
+                    this.sendText('\r');
+                } else if (seq === '\t') {
+                    this.sendText('\t');
+                } else {
+                    this.sendText('\x1b' + seq);
+                }
+                menu.classList.remove('open');
+            };
+            btn.addEventListener('touchstart', handler, { passive: false });
+            btn.addEventListener('click', handler);
+        });
     }
 
     async pasteFromClipboard() {

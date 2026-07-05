@@ -32,6 +32,7 @@
         <!-- Header -->
         <header class="header">
             <div class="header-left">
+                <button id="toggle-files" class="btn-toggle-files">&#9776;</button>
                 <h2>Web Terminal</h2>
             </div>
             <div class="header-center" id="perf-widget">
@@ -94,6 +95,27 @@
             <div class="terminal-container">
                 <div class="terminal-header">
                     <h3>Terminal</h3>
+                    <div class="terminal-keys" id="terminal-keys">
+                        <button class="key-btn key-arrow" data-arrow="A">&#9650;</button>
+                        <button class="key-btn key-arrow" data-arrow="B">&#9660;</button>
+                        <button class="key-btn key-arrow" data-arrow="D">&#9664;</button>
+                        <button class="key-btn key-arrow" data-arrow="C">&#9654;</button>
+                        <div class="key-shortcuts-wrap">
+                            <button class="key-btn key-shortcuts-toggle" id="key-shortcuts-toggle">⌨</button>
+                            <div class="key-shortcuts-menu" id="key-shortcuts-menu">
+                                <button class="key-shortcut" data-seq="c" data-ctrl="1">Ctrl+C</button>
+                                <button class="key-shortcut" data-seq="d" data-ctrl="1">Ctrl+D</button>
+                                <button class="key-shortcut" data-seq="l" data-ctrl="1">Ctrl+L</button>
+                                <button class="key-shortcut" data-seq="z" data-ctrl="1">Ctrl+Z</button>
+                                <button class="key-shortcut" data-seq="a" data-ctrl="1">Ctrl+A</button>
+                                <button class="key-shortcut" data-seq="e" data-ctrl="1">Ctrl+E</button>
+                                <button class="key-shortcut" data-seq="p" data-ctrl="1">Ctrl+P</button>
+                                <button class="key-shortcut" data-seq="\x1b[Z">Shift+Tab</button>
+                                <button class="key-shortcut" data-seq="enter">Enter</button>
+                                <button class="key-shortcut" data-seq="\t">Tab</button>
+                            </div>
+                        </div>
+                    </div>
                     <div class="terminal-actions">
                         <button id="clear-terminal" class="btn-icon" title="Clear">🗑️</button>
                     </div>
@@ -102,6 +124,8 @@
             </div>
         </div>
     </div>
+
+    <div id="panel-overlay" class="panel-overlay"></div>
 
     <script src="static/vendor/xterm.min.js"></script>
     <script src="static/vendor/addon-fit.min.js"></script>

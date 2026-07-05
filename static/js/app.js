@@ -163,6 +163,14 @@ class App {
             }
         });
 
+        // Mobile file panel toggle
+        document.getElementById('toggle-files').addEventListener('click', () => {
+            this.toggleFilePanel();
+        });
+        document.getElementById('panel-overlay').addEventListener('click', () => {
+            this.closeFilePanel();
+        });
+
         // Initialize sort UI
         this.updateSortUI();
     }
@@ -260,6 +268,9 @@ class App {
                 document.getElementById('current-path').value = data.path;
                 this.files = data.files;
                 this.renderFiles();
+                if (window.innerWidth <= 768) {
+                    this.closeFilePanel();
+                }
             }
         } catch (error) {
             console.error('Load files error:', error);
@@ -638,6 +649,23 @@ class App {
 
     hideProgress() {
         document.getElementById('upload-progress').classList.remove('active');
+    }
+
+    toggleFilePanel() {
+        const panel = document.querySelector('.file-browser');
+        const overlay = document.getElementById('panel-overlay');
+        if (panel.classList.contains('open')) {
+            this.closeFilePanel();
+        } else {
+            panel.classList.add('open');
+            overlay.classList.add('active');
+        }
+    }
+
+    closeFilePanel() {
+        document.querySelector('.file-browser').classList.remove('open');
+        document.getElementById('panel-overlay').classList.remove('active');
+        setTimeout(() => window.dispatchEvent(new Event('resize')), 320);
     }
 
     downloadFile(path) {

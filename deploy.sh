@@ -155,6 +155,7 @@ server {
     server_name _;
 
     location /web/ {
+        client_max_body_size 10g;
         proxy_pass http://127.0.0.1:8081/;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
