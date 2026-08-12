@@ -13,7 +13,6 @@
     --accent-color: #4a9eff;
     --accent-hover: #6ab4ff;
     --error-color: #ff4444;
-    --success-color: #44ff44;
     --border-color: #4a4a4a;
     --header-height: 50px;
     --file-browser-width: 300px;
@@ -332,6 +331,7 @@ button[type="submit"]:hover {
     border-radius: 5px;
     cursor: pointer;
     transition: background 0.2s;
+    position: relative;
 }
 
 .file-item:hover {
@@ -369,15 +369,6 @@ button[type="submit"]:hover {
     z-index: 100;
     box-shadow: 0 2px 8px rgba(0,0,0,0.3);
     pointer-events: none;
-}
-
-.file-item {
-    position: relative;
-}
-
-.file-meta {
-    font-size: 9px;
-    color: var(--text-secondary);
 }
 
 .file-meta {

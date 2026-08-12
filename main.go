@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"embed"
+	"flag"
+	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,76 +16,136 @@ import (
 	"webterminal/middleware"
 )
 
+//go:embed static
+var staticFiles embed.FS
+
+const shutdownTimeout = 30 * time.Second
+
 func main() {
-	// Load configuration
-	cfg := loadConfig()
+	path := configPath()
 
-	// Create middleware
-	bruteForce := middleware.NewBruteForce(cfg.MaxAttempts, cfg.BanDuration)
+	cfg := defaultConfig()
+	loadConfig(path, cfg)
 
-	// Create handlers
-	authHandler := handlers.NewAuthHandler(bruteForce, cfg.Login, cfg.Password, cfg.Fail2banLog)
-	terminalHandler := handlers.NewTerminalHandler(cfg.TerminalDir)
-	fileHandler := handlers.NewFileHandler()
-	metricsHandler := handlers.NewMetricsHandler()
+	var showHelp, genConfig, manageService bool
+	flags := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	flags.Usage = func() { writeUsage(flags.Output(), path) }
+	flags.BoolVar(&showHelp, "help", false, "show this help and exit")
+	flags.BoolVar(&showHelp, "h", false, "show this help and exit")
+	flags.BoolVar(&genConfig, "genconfig", false, "write a default config next to the binary and exit")
+	flags.BoolVar(&manageService, "service", false, "create the systemd unit, or remove it if it exists")
+	bindFlags(flags, cfg)
+	flags.Parse(os.Args[1:])
 
-	// Setup routes
-	mux := http.NewServeMux()
-
-	// Static files
-	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("static"))))
-
-	// API endpoints
-	mux.HandleFunc("/api/login", authHandler.Login)
-	mux.HandleFunc("/api/logout", authHandler.Logout)
-	mux.HandleFunc("/api/terminal", terminalHandler.HandleWebSocket)
-	mux.HandleFunc("/api/files", fileHandler.ListFiles)
-	mux.HandleFunc("/api/files/upload", fileHandler.UploadFile)
-	mux.HandleFunc("/api/files/download", fileHandler.DownloadFile)
-	mux.HandleFunc("/api/files/mkdir", fileHandler.CreateFolder)
-	mux.HandleFunc("/api/files/delete", fileHandler.DeleteItem)
-	mux.HandleFunc("/api/files/download-folder", fileHandler.DownloadFolder)
-	mux.HandleFunc("/api/metrics", metricsHandler.GetMetrics)
-
-	// Main page
-	mux.HandleFunc("/", handlers.IndexHandler)
-
-	// Create server
-	server := &http.Server{
-		Addr:         cfg.ListenAddr,
-		Handler:      mux,
-		ReadTimeout:  cfg.ReadTimeout,
-		WriteTimeout: cfg.WriteTimeout,
-		IdleTimeout:  cfg.IdleTimeout,
+	if showHelp {
+		writeUsage(os.Stdout, path)
+		return
 	}
 
-	// Start server
+	if genConfig && manageService {
+		log.Fatalf("--genconfig and --service cannot be combined")
+	}
+
+	if genConfig {
+		if err := writeConfig(path); err != nil {
+			log.Fatalf("Cannot generate config: %v", err)
+		}
+		log.Printf("Wrote %s", path)
+		return
+	}
+
+	if manageService {
+		if err := toggleService(); err != nil {
+			log.Fatalf("Cannot manage %s: %v", serviceName, err)
+		}
+		return
+	}
+
+	serve(cfg)
+}
+
+func serve(cfg *Config) {
+	assets, err := fs.Sub(staticFiles, "static")
+	if err != nil {
+		log.Fatalf("Cannot open embedded assets: %v", err)
+	}
+	page, err := fs.ReadFile(assets, "index.html")
+	if err != nil {
+		log.Fatalf("Cannot read embedded index page: %v", err)
+	}
+
+	bruteForce := middleware.NewBruteForce(int(cfg.MaxAttempts), time.Duration(cfg.BanDuration))
+
+	auth := handlers.NewAuthHandler(bruteForce, handlers.Credentials{
+		Login:       string(cfg.Login),
+		Password:    string(cfg.Password),
+		Fail2banLog: string(cfg.Fail2banLog),
+		SessionTTL:  time.Duration(cfg.SessionTTL),
+	})
+	terminal := handlers.NewTerminalHandler(string(cfg.TerminalDir))
+	files := handlers.NewFileHandler("/")
+	metrics := handlers.NewMetricsHandler()
+
+	mux := http.NewServeMux()
+
+	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(assets))))
+
+	mux.HandleFunc("/api/login", auth.Login)
+	mux.HandleFunc("/api/logout", auth.Logout)
+	mux.HandleFunc("/api/terminal", auth.Require(terminal.HandleWebSocket))
+	mux.HandleFunc("/api/metrics", auth.Require(metrics.GetMetrics))
+	mux.HandleFunc("/api/files", auth.Require(files.ListFiles))
+	mux.HandleFunc("/api/files/upload", auth.Require(files.UploadFile))
+	mux.HandleFunc("/api/files/download", auth.Require(files.DownloadFile))
+	mux.HandleFunc("/api/files/download-folder", auth.Require(files.DownloadFolder))
+	mux.HandleFunc("/api/files/mkdir", auth.Require(files.CreateFolder))
+	mux.HandleFunc("/api/files/delete", auth.Require(files.DeleteItem))
+
+	mux.HandleFunc("/", handlers.IndexHandler(page))
+
+	server := &http.Server{
+		Addr:              string(cfg.ListenAddr),
+		Handler:           mux,
+		ReadHeaderTimeout: time.Duration(cfg.ReadHeaderTimeout),
+		IdleTimeout:       time.Duration(cfg.IdleTimeout),
+	}
+
 	go func() {
 		log.Printf("Starting web terminal on %s", cfg.ListenAddr)
+		warnDefaultPassword(cfg)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed: %v", err)
 		}
 	}()
 
-	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
 	log.Println("Shutting down server...")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("Server forced to shutdown: %v", err)
+		log.Printf("Server forced to shutdown: %v", err)
 	}
 
 	log.Println("Server exited")
 }
 
-func init() {
-	// Set working directory (will be overridden by config if present)
-	if err := os.Chdir("/root/terminal"); err != nil {
-		log.Printf("Warning: Could not change to /root/terminal: %v", err)
+func warnDefaultPassword(cfg *Config) {
+	if cfg.Password != defaultConfig().Password || isLoopbackAddr(string(cfg.ListenAddr)) {
+		return
 	}
+	log.Printf("WARNING: the default password is in use and %s is reachable from the network. "+
+		"Set a password in %s or pass --password.", cfg.ListenAddr, configName)
+}
+
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

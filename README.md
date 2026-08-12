@@ -6,19 +6,49 @@
 
 ## English
 
-Web-based terminal with file browser and performance monitoring. Single Go binary, no external runtime dependencies.
+A web terminal with a file browser and performance monitoring, shipped as a
+single self-contained binary. The frontend is compiled into the executable —
+copy one file to a server, run it, and open the page.
 
 ### Features
 
-- Real PTY shell via WebSocket (not emulation)
-- File browser with drag-and-drop upload/download
+- Real PTY shell over WebSocket (not an emulation)
+- File browser with drag-and-drop upload and download
 - Path input with autocomplete — type a path and press Enter to navigate
-- Middle-click on file/folder pastes its path into the terminal
-- Upload progress bar for files and nested folders
+- Middle-click a file or folder to paste its path into the terminal
+- Upload progress for files and nested folders
 - Performance widget: CPU graph, RAM, network throughput
 - Dark theme, responsive layout
-- Brute force protection with fail2ban integration
-- WebSocket keepalive — session survives idle
+- Brute-force protection with a fail2ban-compatible log
+- WebSocket keepalive — the session survives idle periods
+
+### Quick Start
+
+```bash
+./webterminal
+```
+
+That is the whole setup. The server listens on `0.0.0.0:8089`; log in with
+**root** / **admin**.
+
+> **Change the password before putting this on a public network.** The defaults
+> give anyone who can reach the port a root shell. The binary prints a warning at
+> startup while the default password is in use on a non-loopback address.
+
+#### Build from source
+
+```bash
+./build.sh
+```
+
+Produces `bin/webterminal`: statically linked for `linux/amd64`, stripped,
+with `static/` embedded via `go:embed`. The script refuses to build when an
+embedded asset is missing (that would otherwise yield a binary whose interface
+404s at runtime), confirms the result is not dynamically linked, and then clears
+the leftover build artifacts and the Go build cache. Sources are never touched.
+
+Requires Go 1.22+; set `GO=/path/to/go` if the toolchain is not on `PATH`.
+Linux only — metrics are read from `/proc`.
 
 ### Keyboard Shortcuts & Mouse Actions
 
@@ -26,56 +56,110 @@ Web-based terminal with file browser and performance monitoring. Single Go binar
 |--------|----------|
 | Copy selected text | Auto-copies to clipboard on select |
 | Paste into terminal | Right-click or Ctrl+Shift+V |
-| Paste file/folder path into terminal | Middle-click on file in browser |
-| Navigate to path | Type path in address bar, press Enter |
-| Autocomplete path | Type partial path, use Arrow keys / Tab |
+| Paste file/folder path into terminal | Middle-click a file in the browser |
+| Navigate to path | Type a path in the address bar, press Enter |
+| Autocomplete path | Type part of a path, use Arrow keys / Tab |
 
-### Quick Start
+### Configuration
 
-#### Prerequisites
+Settings are resolved in three layers, each overriding the one before it:
 
-- Go 1.21+
-- nginx (for reverse proxy + TLS)
-- Linux (reads /proc for metrics)
+1. Built-in defaults
+2. `config.json` **next to the binary** (optional)
+3. Command-line options
 
-#### One-liner deploy on fresh VPS
+Anything left unset at every layer keeps its default, so a partial config file
+and a single command-line option are both perfectly valid.
 
-```bash
-curl -sL https://raw.githubusercontent.com/Ground-Zerro/web-terminal/main/deploy.sh | bash
-```
-
-This installs Go, nginx, builds the binary, configures everything, and starts the service.
-
-#### Build
+#### Generating a config file
 
 ```bash
-go build -o webterminal .
+./webterminal --genconfig
 ```
 
-#### Run (development)
+Writes `config.json` next to the binary with every key at its default value and
+mode `0600`. It refuses to overwrite an existing file.
+
+```json
+{
+    "listen_addr": "0.0.0.0:8089",
+    "login": "root",
+    "password": "admin",
+    "terminal_dir": "/root",
+    "fail2ban_log": "/var/log/webterminal-bruteforce.log",
+    "max_attempts": 6,
+    "ban_duration": 15,
+    "session_ttl": 720,
+    "read_header_timeout": 15,
+    "idle_timeout": 120
+}
+```
+
+#### Parameters
+
+Every config key has a matching command-line option: replace `_` with `-`.
+
+| Config key | Option | Type | Default | Description |
+|---|---|---|---|---|
+| `listen_addr` | `--listen-addr` | string | `0.0.0.0:8089` | Address and port to listen on |
+| `login` | `--login` | string | `root` | Login name |
+| `password` | `--password` | string | `admin` | Password |
+| `terminal_dir` | `--terminal-dir` | string | `/root` | Directory the shell starts in |
+| `fail2ban_log` | `--fail2ban-log` | string | `/var/log/webterminal-bruteforce.log` | Failed-login log for fail2ban |
+| `max_attempts` | `--max-attempts` | int | `6` | Failed logins before an address is banned |
+| `ban_duration` | `--ban-duration` | min | `15` | Ban duration |
+| `session_ttl` | `--session-ttl` | min | `720` | Idle time before a session expires; every request slides the deadline |
+| `read_header_timeout` | `--read-header-timeout` | sec | `15` | Deadline for reading request headers |
+| `idle_timeout` | `--idle-timeout` | sec | `120` | Keep-alive idle timeout |
+
+Request and response bodies are deliberately not time-limited, so multi-gigabyte
+uploads, ZIP downloads and long-lived WebSocket sessions are never cut off.
+
+#### Examples
 
 ```bash
-./webterminal
-# Listens on http://127.0.0.1:8081
+./webterminal --help
+./webterminal --login alice --password 'correct horse battery staple'
+./webterminal --listen-addr 127.0.0.1:9090      # bind to loopback for nginx
+./webterminal --terminal-dir /srv --session-ttl 60
 ```
 
-### Production Deployment
+Options override the config file for that run only; the file is never modified.
 
-#### 1. Systemd Service
+### Running as a Service (optional)
 
-Create `/etc/systemd/system/webterminal.service`:
+```bash
+sudo ./webterminal --service
+```
+
+`--service` is a toggle and requires root:
+
+- **No unit yet** → writes `/etc/systemd/system/webterminal.service` with
+  `ExecStart` set to wherever this binary currently lives, reloads systemd, then
+  enables and starts the service.
+- **Unit already there** → stops, disables and deletes it, then reloads systemd.
+  This happens regardless of which binary the existing unit points at, so moving
+  the binary is a matter of running `--service` twice: once at the old location
+  to clear the unit, once at the new one to recreate it.
+
+```bash
+sudo install -m 755 webterminal /usr/local/bin/webterminal
+sudo /usr/local/bin/webterminal --service
+journalctl -u webterminal -f
+```
+
+The generated unit:
 
 ```ini
 [Unit]
-Description=Web Terminal Server (behind nginx)
+Description=Web Terminal
 After=network.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root/terminal
-ExecStart=/root/terminal/webterminal
+ExecStart="/usr/local/bin/webterminal"
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -86,18 +170,27 @@ SyslogIdentifier=webterminal
 WantedBy=multi-user.target
 ```
 
+`WorkingDirectory` is not needed: assets are embedded and `config.json` is looked
+up next to the executable. The service therefore reads the same config file that
+`--genconfig` writes, so configure the service by editing that file and running
+`systemctl restart webterminal`.
+
+To uninstall completely: `sudo ./webterminal --service` to drop the unit, then
+remove the binary and its `config.json`.
+
+### Behind nginx with TLS (optional)
+
+The binary speaks plain HTTP and has no certificate handling by design. To put it
+behind TLS, bind it to loopback and terminate TLS at nginx:
+
 ```bash
-systemctl daemon-reload
-systemctl enable --now webterminal
+./webterminal --listen-addr 127.0.0.1:9090
 ```
-
-#### 2. Nginx Reverse Proxy
-
-Add to your nginx config (`/etc/nginx/sites-available/your-site`):
 
 ```nginx
 location /web/ {
-    proxy_pass http://127.0.0.1:8081/;
+    client_max_body_size 10g;
+    proxy_pass http://127.0.0.1:9090/;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
@@ -111,153 +204,93 @@ location /web/ {
 ```
 
 Key settings:
-- `proxy_read_timeout 300s` — WebSocket idle timeout (keepalive ping runs every 30s)
-- `proxy_set_header Upgrade/Connection` — required for WebSocket upgrade
+- `proxy_read_timeout 300s` — WebSocket idle timeout (keepalive pings every 30s)
+- `proxy_set_header Upgrade/Connection` — required for the WebSocket upgrade
+- `X-Real-IP` — the binary trusts proxy headers only from a loopback peer, so
+  brute-force bans apply to the real client address
 
 ```bash
+apt-get install -y certbot python3-certbot-nginx
+certbot --nginx -d your-domain.example
 nginx -t && systemctl reload nginx
 ```
-
-#### 3. SSL (optional)
-
-For HTTPS, add TLS to the nginx server block. Self-signed or Let's Encrypt — your choice.
 
 ### Architecture
 
 ```
-Browser ──HTTPS──▶ nginx:443 ──HTTP──▶ Go:8081
-                        │                  │
-                   static files      ├── /api/login
-                   (index.html,      ├── /api/terminal  (WebSocket)
-                    css/, js/)       ├── /api/metrics   (CPU/RAM/Net)
-                                     ├── /api/files/*   (file browser)
-                                     └── /              (SPA entry)
+Browser ──HTTPS──▶ nginx ──HTTP──▶ webterminal
+                                   ├── /              (page, embedded)
+                                   ├── /static/*      (css/js, embedded)
+                                   ├── /api/login
+                                   ├── /api/terminal  (WebSocket PTY)
+                                   ├── /api/metrics   (CPU/RAM/network)
+                                   └── /api/files/*   (file browser)
 ```
 
 ### Project Structure
 
 ```
 .
-├── main.go                    # Entry point, routes, server
-├── config.go                  # Config file loader with defaults
-├── config.json.example        # Example configuration file
+├── build.sh                   # static linux/amd64 build into bin/, then cleanup
+├── main.go                    # go:embed, flags, routes, graceful shutdown
+├── config.go                  # defaults, config file, flags, --help rendering
+├── service.go                 # --service: install/remove the systemd unit
 ├── go.mod / go.sum            # Go module dependencies
 ├── handlers/
-│   ├── auth.go                # Login/logout, session management
-│   ├── terminal.go            # WebSocket PTY, keepalive ping/pong
-│   ├── files.go               # File CRUD, upload, download
-│   └── metrics.go             # System metrics (/proc reader)
+│   ├── http.go                # Response envelope, JSON helpers, method guard
+│   ├── auth.go                # Login/logout, sessions, Require middleware
+│   ├── terminal.go            # WebSocket PTY bridge, keepalive, resize
+│   ├── files.go               # File CRUD, upload, download, path resolution
+│   └── metrics.go             # System metrics (buffered /proc reader)
 ├── middleware/
 │   └── bruteforce.go          # In-memory IP rate limiting
-└── static/
-    ├── index.html             # SPA entry
-    ├── css/style.css          # Dark theme styles
-    └── js/
-        ├── app.js             # Main app logic
-        ├── terminal.js        # xterm.js + WebSocket client
-        └── perf.js            # Performance widget (CPU graph)
+└── static/                    # Embedded into the binary at build time
+    ├── index.html
+    ├── css/style.css
+    ├── js/
+    │   ├── core.js            # formatBytes, Settings, Session, ApiClient
+    │   ├── keyboard.js        # On-screen key bar
+    │   ├── terminal.js        # xterm.js + WebSocket client
+    │   ├── filelist.js        # File list rendering and sorting
+    │   ├── perf.js            # Performance widget (CPU graph)
+    │   └── app.js             # Session flow and wiring
+    └── vendor/                # xterm.js 5.5.0 + addons (committed, required to build)
 ```
 
 ### API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/api/login` | Authenticate, returns session token |
-| POST | `/api/logout` | Invalidate session |
+| POST | `/api/login` | Authenticate, returns a session token |
+| POST | `/api/logout` | Invalidate the session |
 | GET | `/api/terminal?token=...` | WebSocket terminal connection |
 | GET | `/api/metrics` | System metrics (CPU/RAM/network) |
 | GET | `/api/files?path=...` | List directory contents |
-| POST | `/api/files/upload` | Upload file(s) |
-| GET | `/api/files/download?path=...` | Download file |
-| GET | `/api/files/download-folder?path=...` | Download directory as ZIP |
-| POST | `/api/files/mkdir` | Create directory |
-| POST | `/api/files/delete` | Delete file or directory |
+| POST | `/api/files/upload` | Upload a file |
+| GET | `/api/files/download?path=...` | Download a file |
+| GET | `/api/files/download-folder?path=...` | Download a directory as ZIP |
+| POST | `/api/files/mkdir` | Create a directory |
+| POST | `/api/files/delete` | Delete a file or directory |
 
-### Configuration
+Every endpoint except `/api/login` requires a session token, normally sent as an
+`Authorization` header. `/api/terminal` and the two download endpoints also
+accept `?token=...`, because a WebSocket handshake and an `<a download>` link
+cannot carry custom headers. Such tokens end up in reverse-proxy access logs.
 
-The application supports a `config.json` file located next to the binary (in the working directory). If the file is missing or a parameter is absent, built-in defaults are used.
+### Updating the Vendored Frontend
 
-Create `config.json`:
-
-```json
-{
-    "listen_addr": "127.0.0.1:8081",
-    "login": "admin",
-    "password": "root",
-    "work_dir": "/root/terminal",
-    "terminal_dir": "/root",
-    "fail2ban_log": "/var/log/webterminal-bruteforce.log",
-    "max_attempts": 6,
-    "ban_duration": 15,
-    "read_timeout": 30,
-    "write_timeout": 30,
-    "idle_timeout": 120
-}
-```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `listen_addr` | string | `127.0.0.1:8081` | Server bind address |
-| `login` | string | `admin` | Login credential |
-| `password` | string | `root` | Password credential |
-| `work_dir` | string | `/root/terminal` | Application working directory |
-| `terminal_dir` | string | `/root` | Terminal shell starting directory |
-| `fail2ban_log` | string | `/var/log/webterminal-bruteforce.log` | fail2ban log path |
-| `max_attempts` | int | `6` | Max login attempts before ban |
-| `ban_duration` | int (min) | `15` | Ban duration in minutes |
-| `read_timeout` | int (sec) | `30` | HTTP read timeout |
-| `write_timeout` | int (sec) | `30` | HTTP write timeout |
-| `idle_timeout` | int (sec) | `120` | HTTP idle timeout |
-
-### Replacing Vendor Files
-
-The `static/vendor/` directory is gitignored. Install manually:
+`static/vendor/` is committed because `go:embed` needs it at build time.
 
 ```bash
 cd static/vendor
-# xterm.js
 curl -LO https://unpkg.com/@xterm/xterm@5.5.0/lib/xterm.min.js
 curl -LO https://unpkg.com/@xterm/xterm@5.5.0/css/xterm.min.css
-# Fit addon
 curl -LO https://unpkg.com/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js
-# Unicode addon
 curl -LO https://unpkg.com/@xterm/addon-unicode11@0.8.0/lib/addon-unicode11.min.js
-# Web links addon
 curl -LO https://unpkg.com/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js
 ```
 
-### Commands
-
-```bash
-# Check status
-systemctl status webterminal
-
-# View logs
-journalctl -u webterminal -f
-
-# Restart (briefly drops active sessions)
-systemctl restart webterminal
-
-# Graceful deploy without dropping sessions
-kill $(pgrep -f webterminal) && sleep 1 && nohup ./webterminal > /var/log/webterminal.log 2>&1 &
-```
-
-### Uninstall
-
-One-liner to remove everything deployed by `deploy.sh`:
-
-```bash
-curl -sL https://raw.githubusercontent.com/Ground-Zerro/web-terminal/main/destroy.sh | bash
-```
-
-The script will ask for confirmation, then remove:
-- webterminal systemd service
-- nginx config for `/web/`
-- project files (`/root/terminal`)
-- logs (`/var/log/webterminal*`)
-- Go (only if installed by deploy.sh)
-
-System packages (git, nginx, curl, build-essential) are **not** removed.
+Rebuild afterwards so the new files are embedded.
 
 ### License
 
@@ -267,19 +300,48 @@ MIT
 
 ## Русский
 
-Веб-терминал с файловым менеджером и мониторингом производительности. Одиночный Go-бинарник, без внешних рантайм-зависимостей.
+Веб-терминал с файловым менеджером и мониторингом производительности в виде
+одного самодостаточного бинарника. Фронтенд вкомпилирован в исполняемый файл —
+скопируйте один файл на сервер, запустите и откройте страницу.
 
 ### Возможности
 
 - Настоящий PTY-шелл через WebSocket (не эмуляция)
-- Файловый менеджер с drag-and-drop загрузкой/скачиванием
-- Поле ввода пути с автокомплитом — введите путь и нажмите Enter
-- Средний клик по файлу/папке вставляет путь в терминал
-- Прогресс-бар при загрузке файлов и вложенных каталогов
+- Файловый менеджер с drag-and-drop загрузкой и скачиванием
+- Поле ввода пути с автодополнением — введите путь и нажмите Enter
+- Средний клик по файлу или папке вставляет путь в терминал
+- Прогресс загрузки для файлов и вложенных каталогов
 - Виджет производительности: график CPU, RAM, сетевой трафик
 - Тёмная тема, адаптивный интерфейс
-- Защита от брутфорса с интеграцией fail2ban
+- Защита от брутфорса с логом в формате для fail2ban
 - WebSocket keepalive — сессия переживает простой
+
+### Быстрый старт
+
+```bash
+./webterminal
+```
+
+Это вся настройка. Сервер слушает `0.0.0.0:8089`, вход — **root** / **admin**.
+
+> **Смените пароль, прежде чем выставлять сервис в публичную сеть.** Умолчания
+> дают root-шелл любому, кто дотянется до порта. Пока используется пароль по
+> умолчанию и адрес не петлевой, бинарник пишет предупреждение при старте.
+
+#### Сборка из исходников
+
+```bash
+./build.sh
+```
+
+На выходе `bin/webterminal`: статически слинкованный под `linux/amd64`, без
+отладочных символов, со встроенной через `go:embed` папкой `static/`. Скрипт
+откажется собирать, если пропал встраиваемый файл (иначе получился бы бинарник,
+у которого интерфейс отдаёт 404), проверит, что результат не слинкован
+динамически, и уберёт за собой артефакты сборки и кэш Go. Исходники не трогает.
+
+Нужен Go 1.22+; если тулчейн не в `PATH`, укажите `GO=/path/to/go`. Только Linux —
+метрики читаются из `/proc`.
 
 ### Горячие клавиши и действия мыши
 
@@ -291,52 +353,108 @@ MIT
 | Перейти по пути | Введите путь в адресную строку, нажмите Enter |
 | Автодополнение пути | Введите часть пути, используйте стрелки / Tab |
 
-### Быстрый старт
+### Конфигурация
 
-#### Требования
+Настройки собираются из трёх слоёв, каждый перекрывает предыдущий:
 
-- Go 1.21+
-- nginx (для реверс-прокси + TLS)
-- Linux (чтение /proc для метрик)
+1. Встроенные значения по умолчанию
+2. `config.json` **рядом с бинарником** (необязателен)
+3. Ключи запуска
 
-#### Однострочный деплой на чистый VPS
+Всё, что не задано ни на одном слое, остаётся значением по умолчанию — поэтому
+частичный конфиг и одиночный ключ запуска одинаково допустимы.
 
-```bash
-curl -sL https://raw.githubusercontent.com/Ground-Zerro/web-terminal/main/deploy.sh | bash
-```
-
-Скрипт установит Go, nginx, соберёт бинарник, настроит всё и запустит сервис.
-
-#### Сборка
+#### Генерация конфигурационного файла
 
 ```bash
-go build -o webterminal .
+./webterminal --genconfig
 ```
 
-#### Запуск (разработка)
+Пишет `config.json` рядом с бинарником со всеми ключами в значениях по умолчанию
+и правами `0600`. Существующий файл не перезаписывается.
+
+```json
+{
+    "listen_addr": "0.0.0.0:8089",
+    "login": "root",
+    "password": "admin",
+    "terminal_dir": "/root",
+    "fail2ban_log": "/var/log/webterminal-bruteforce.log",
+    "max_attempts": 6,
+    "ban_duration": 15,
+    "session_ttl": 720,
+    "read_header_timeout": 15,
+    "idle_timeout": 120
+}
+```
+
+#### Параметры
+
+У каждого ключа конфига есть парный ключ запуска: замените `_` на `-`.
+
+| Ключ конфига | Ключ запуска | Тип | Умолчание | Описание |
+|---|---|---|---|---|
+| `listen_addr` | `--listen-addr` | string | `0.0.0.0:8089` | Адрес и порт прослушивания |
+| `login` | `--login` | string | `root` | Логин |
+| `password` | `--password` | string | `admin` | Пароль |
+| `terminal_dir` | `--terminal-dir` | string | `/root` | Начальный каталог шелла |
+| `fail2ban_log` | `--fail2ban-log` | string | `/var/log/webterminal-bruteforce.log` | Лог неудачных входов для fail2ban |
+| `max_attempts` | `--max-attempts` | int | `6` | Неудачных входов до бана адреса |
+| `ban_duration` | `--ban-duration` | мин | `15` | Длительность бана |
+| `session_ttl` | `--session-ttl` | мин | `720` | Простой до истечения сессии; каждый запрос сдвигает дедлайн |
+| `read_header_timeout` | `--read-header-timeout` | сек | `15` | Дедлайн чтения заголовков запроса |
+| `idle_timeout` | `--idle-timeout` | сек | `120` | Таймаут keep-alive |
+
+Тела запросов и ответов намеренно не ограничены по времени, чтобы многогигабайтные
+загрузки, скачивание ZIP и долгие WebSocket-сессии не обрывались.
+
+#### Примеры
 
 ```bash
-./webterminal
-# Слушает на http://127.0.0.1:8081
+./webterminal --help
+./webterminal --login alice --password 'correct horse battery staple'
+./webterminal --listen-addr 127.0.0.1:9090      # петлевой адрес для nginx
+./webterminal --terminal-dir /srv --session-ttl 60
 ```
 
-### Продакшн-деплой
+Ключи перекрывают конфигурационный файл только для текущего запуска; сам файл не
+изменяется.
 
-#### 1. Systemd-сервис
+### Запуск как сервис (опционально)
 
-Создайте `/etc/systemd/system/webterminal.service`:
+```bash
+sudo ./webterminal --service
+```
+
+`--service` работает как переключатель и требует root:
+
+- **Юнита ещё нет** → создаётся `/etc/systemd/system/webterminal.service`, где
+  `ExecStart` указывает на текущее расположение этого бинарника; systemd
+  перечитывает конфигурацию, служба включается в автозапуск и стартует.
+- **Юнит уже есть** → служба останавливается, снимается с автозапуска и юнит
+  удаляется, после чего systemd перечитывает конфигурацию. Это происходит
+  независимо от того, на какой бинарник указывал существующий юнит, поэтому
+  переезд бинарника — это два запуска `--service`: один на старом месте, чтобы
+  убрать юнит, второй на новом, чтобы создать заново.
+
+```bash
+sudo install -m 755 webterminal /usr/local/bin/webterminal
+sudo /usr/local/bin/webterminal --service
+journalctl -u webterminal -f
+```
+
+Создаваемый юнит:
 
 ```ini
 [Unit]
-Description=Web Terminal Server (behind nginx)
+Description=Web Terminal
 After=network.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root/terminal
-ExecStart=/root/terminal/webterminal
+ExecStart="/usr/local/bin/webterminal"
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -347,18 +465,26 @@ SyslogIdentifier=webterminal
 WantedBy=multi-user.target
 ```
 
+`WorkingDirectory` не нужен: статика встроена, а `config.json` ищется рядом с
+исполняемым файлом. Служба читает тот же конфиг, что пишет `--genconfig`, — то
+есть настраивается правкой этого файла и командой `systemctl restart webterminal`.
+
+Для полного удаления: `sudo ./webterminal --service` уберёт юнит, затем удалите
+бинарник и его `config.json`.
+
+### За nginx с TLS (опционально)
+
+Бинарник намеренно работает по обычному HTTP и не умеет сертификаты. Чтобы
+закрыть его TLS, привяжите к петлевому адресу и терминируйте TLS на nginx:
+
 ```bash
-systemctl daemon-reload
-systemctl enable --now webterminal
+./webterminal --listen-addr 127.0.0.1:9090
 ```
-
-#### 2. Nginx reverse proxy
-
-Добавьте в конфигурацию nginx (`/etc/nginx/sites-available/your-site`):
 
 ```nginx
 location /web/ {
-    proxy_pass http://127.0.0.1:8081/;
+    client_max_body_size 10g;
+    proxy_pass http://127.0.0.1:9090/;
     proxy_http_version 1.1;
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection "upgrade";
@@ -372,51 +498,57 @@ location /web/ {
 ```
 
 Ключевые настройки:
-- `proxy_read_timeout 300s` — таймаут idle-подключения WebSocket (keepalive-пинг каждые 30 сек)
+- `proxy_read_timeout 300s` — таймаут простоя WebSocket (keepalive-пинг раз в 30 с)
 - `proxy_set_header Upgrade/Connection` — обязательно для WebSocket-апгрейда
+- `X-Real-IP` — бинарник доверяет заголовкам прокси только от петлевого пира,
+  поэтому бан брутфорса применяется к реальному адресу клиента
 
 ```bash
+apt-get install -y certbot python3-certbot-nginx
+certbot --nginx -d your-domain.example
 nginx -t && systemctl reload nginx
 ```
-
-#### 3. SSL (опционально)
-
-Для HTTPS добавьте TLS в server-блок nginx. Самоподписанный или Let's Encrypt — на ваш выбор.
 
 ### Архитектура
 
 ```
-Браузер ──HTTPS──▶ nginx:443 ──HTTP──▶ Go:8081
-                        │                  │
-                   статические        ├── /api/login
-                   файлы              ├── /api/terminal  (WebSocket)
-                   (index.html,       ├── /api/metrics   (CPU/RAM/Сеть)
-                   css/, js/)         ├── /api/files/*   (файловый менеджер)
-                                      └── /              (SPA точка входа)
+Браузер ──HTTPS──▶ nginx ──HTTP──▶ webterminal
+                                   ├── /              (страница, встроена)
+                                   ├── /static/*      (css/js, встроены)
+                                   ├── /api/login
+                                   ├── /api/terminal  (WebSocket PTY)
+                                   ├── /api/metrics   (CPU/RAM/сеть)
+                                   └── /api/files/*   (файловый менеджер)
 ```
 
 ### Структура проекта
 
 ```
 .
-├── main.go                    # Точка входа, маршруты, сервер
-├── config.go                  # Загрузчик конфигурации с дефолтами
-├── config.json.example        # Пример конфигурационного файла
+├── build.sh                   # статическая сборка linux/amd64 в bin/ и уборка
+├── main.go                    # go:embed, ключи, маршруты, graceful shutdown
+├── config.go                  # умолчания, конфиг, ключи, отрисовка --help
+├── service.go                 # --service: установка/удаление systemd-юнита
 ├── go.mod / go.sum            # Зависимости Go-модуля
 ├── handlers/
-│   ├── auth.go                # Логин/выход, управление сессиями
-│   ├── terminal.go            # WebSocket PTY, keepalive ping/pong
-│   ├── files.go               # Файловые CRUD-операции, загрузка/скачивание
-│   └── metrics.go             # Системные метрики (чтение /proc)
+│   ├── http.go                # Конверт ответа, JSON-хелперы, guard по методу
+│   ├── auth.go                # Логин/выход, сессии, middleware Require
+│   ├── terminal.go            # Мост WebSocket ↔ PTY, keepalive, resize
+│   ├── files.go               # Файловые CRUD-операции, разбор путей
+│   └── metrics.go             # Системные метрики (буферизованное чтение /proc)
 ├── middleware/
 │   └── bruteforce.go          # Лимитирование IP в памяти
-└── static/
-    ├── index.html             # Точка входа SPA
-    ├── css/style.css          # Стили тёмной темы
-    └── js/
-        ├── app.js             # Основная логика приложения
-        ├── terminal.js        # Клиент xterm.js + WebSocket
-        └── perf.js            # Виджет производительности (график CPU)
+└── static/                    # Встраивается в бинарник при сборке
+    ├── index.html
+    ├── css/style.css
+    ├── js/
+    │   ├── core.js            # formatBytes, Settings, Session, ApiClient
+    │   ├── keyboard.js        # Экранная панель клавиш
+    │   ├── terminal.js        # Клиент xterm.js + WebSocket
+    │   ├── filelist.js        # Отрисовка и сортировка списка файлов
+    │   ├── perf.js            # Виджет производительности (график CPU)
+    │   └── app.js             # Поток сессии и связывание компонентов
+    └── vendor/                # xterm.js 5.5.0 + аддоны (в репозитории, нужны для сборки)
 ```
 
 ### API-эндпоинты
@@ -428,97 +560,32 @@ nginx -t && systemctl reload nginx
 | GET | `/api/terminal?token=...` | WebSocket-подключение терминала |
 | GET | `/api/metrics` | Системные метрики (CPU/RAM/сеть) |
 | GET | `/api/files?path=...` | Список файлов в директории |
-| POST | `/api/files/upload` | Загрузка файла(ов) |
+| POST | `/api/files/upload` | Загрузка файла |
 | GET | `/api/files/download?path=...` | Скачивание файла |
 | GET | `/api/files/download-folder?path=...` | Скачивание директории как ZIP |
 | POST | `/api/files/mkdir` | Создание директории |
 | POST | `/api/files/delete` | Удаление файла или директории |
 
-### Конфигурация
+Все эндпоинты, кроме `/api/login`, требуют токен сессии — обычно он передаётся
+в заголовке `Authorization`. `/api/terminal` и два эндпоинта скачивания
+дополнительно принимают `?token=...`, поскольку WebSocket-рукопожатие и ссылка
+`<a download>` не умеют отправлять свои заголовки. Такие токены попадают
+в access-лог обратного прокси.
 
-Приложение поддерживает файл `config.json` рядом с бинарником (в рабочей директории). Если файл отсутствует или параметр не указан, используются встроенные дефолты.
+### Обновление vendor-файлов фронтенда
 
-Создайте `config.json`:
-
-```json
-{
-    "listen_addr": "127.0.0.1:8081",
-    "login": "admin",
-    "password": "root",
-    "work_dir": "/root/terminal",
-    "terminal_dir": "/root",
-    "fail2ban_log": "/var/log/webterminal-bruteforce.log",
-    "max_attempts": 6,
-    "ban_duration": 15,
-    "read_timeout": 30,
-    "write_timeout": 30,
-    "idle_timeout": 120
-}
-```
-
-| Параметр | Тип | Дефолт | Описание |
-|----------|-----|--------|----------|
-| `listen_addr` | string | `127.0.0.1:8081` | Адрес прослушивания сервера |
-| `login` | string | `admin` | Логин |
-| `password` | string | `root` | Пароль |
-| `work_dir` | string | `/root/terminal` | Рабочая директория приложения |
-| `terminal_dir` | string | `/root` | Начальная директория терминала |
-| `fail2ban_log` | string | `/var/log/webterminal-bruteforce.log` | Путь к логу fail2ban |
-| `max_attempts` | int | `6` | Макс. попыток входа до бана |
-| `ban_duration` | int (мин) | `15` | Длительность бана в минутах |
-| `read_timeout` | int (сек) | `30` | Таймаут чтения HTTP |
-| `write_timeout` | int (сек) | `30` | Таймаут записи HTTP |
-| `idle_timeout` | int (сек) | `120` | Таймаут idle-подключения |
-
-### Замена vendor-файлов
-
-Директория `static/vendor/` исключена из git. Установите вручную:
+`static/vendor/` лежит в репозитории, потому что `go:embed` нужен на этапе сборки.
 
 ```bash
 cd static/vendor
-# xterm.js
 curl -LO https://unpkg.com/@xterm/xterm@5.5.0/lib/xterm.min.js
 curl -LO https://unpkg.com/@xterm/xterm@5.5.0/css/xterm.min.css
-# Fit addon
 curl -LO https://unpkg.com/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js
-# Unicode addon
 curl -LO https://unpkg.com/@xterm/addon-unicode11@0.8.0/lib/addon-unicode11.min.js
-# Web links addon
 curl -LO https://unpkg.com/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js
 ```
 
-### Команды
-
-```bash
-# Проверить статус
-systemctl status webterminal
-
-# Смотреть логи
-journalctl -u webterminal -f
-
-# Перезапустить (временно разорвёт активные сессии)
-systemctl restart webterminal
-
-# Мягкий деплой без разрыва сессий
-kill $(pgrep -f webterminal) && sleep 1 && nohup ./webterminal > /var/log/webterminal.log 2>&1 &
-```
-
-### Удаление
-
-Однострочная команда для удаления всего, что установил `deploy.sh`:
-
-```bash
-curl -sL https://raw.githubusercontent.com/Ground-Zerro/web-terminal/main/destroy.sh | bash
-```
-
-Скрипт запросит подтверждение и удалит:
-- systemd-сервис webterminal
-- конфигурацию nginx для `/web/`
-- файлы проекта (`/root/terminal`)
-- логи (`/var/log/webterminal*`)
-- Go (только если был установлен deploy.sh)
-
-Системные пакеты (git, nginx, curl, build-essential) **не удаляются**.
+После этого пересоберите бинарник, чтобы новые файлы попали внутрь.
 
 ### Лицензия
 

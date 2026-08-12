@@ -1,124 +1,83 @@
-// Performance Widget
 class PerfWidget {
-    constructor() {
-        this.cpuHistory = new Array(30).fill(0);
-        this.canvas = null;
-        this.ctx = null;
-        this.pollInterval = null;
-        this.token = null;
+    static HISTORY = 30;
+    static POLL_INTERVAL = 1000;
+    static BACKGROUND = '#1a1a1a';
+    static LINE = '#4a9eff';
+    static FILL_TOP = 'rgba(74, 158, 255, 0.6)';
+    static FILL_BOTTOM = 'rgba(74, 158, 255, 0.1)';
+
+    constructor(api, elements) {
+        this.api = api;
+        this.elements = elements;
+        this.context = elements.canvas.getContext('2d');
+        this.history = new Float64Array(PerfWidget.HISTORY);
+        this.head = 0;
+        this.timer = null;
     }
 
-    start(token) {
-        this.token = token;
-        this.canvas = document.getElementById('cpu-graph');
-        this.ctx = this.canvas.getContext('2d');
+    start() {
+        this.stop();
         this.poll();
-        this.pollInterval = setInterval(() => this.poll(), 1000);
+        this.timer = setInterval(() => this.poll(), PerfWidget.POLL_INTERVAL);
     }
 
     stop() {
-        if (this.pollInterval) {
-            clearInterval(this.pollInterval);
-            this.pollInterval = null;
-        }
+        clearInterval(this.timer);
+        this.timer = null;
     }
 
     async poll() {
+        let metrics;
         try {
-            const resp = await fetch('api/metrics', {
-                headers: { 'Authorization': this.token }
-            });
-            if (!resp.ok) return;
-            const data = await resp.json();
-
-            // CPU
-            this.cpuHistory.push(data.cpu.usage_percent);
-            if (this.cpuHistory.length > 30) this.cpuHistory.shift();
-            this.drawCPU(data.cpu.usage_percent);
-
-            // Memory
-            const memUsed = this.formatBytes(data.memory.used);
-            const memTotal = this.formatBytes(data.memory.total);
-            document.getElementById('mem-text').textContent = `MEM ${memUsed}/${memTotal}`;
-
-            // Network
-            const rx = this.formatSpeed(data.network.rx_bytes_per_sec);
-            const tx = this.formatSpeed(data.network.tx_bytes_per_sec);
-            document.getElementById('net-text').innerHTML = `&darr;${rx} &uarr;${tx}`;
-        } catch (e) {
-            // silent — metrics endpoint may not be available yet
+            metrics = await this.api.get('api/metrics');
+        } catch (error) {
+            return;
         }
+
+        this.history[this.head] = metrics.cpu.usage_percent;
+        this.head = (this.head + 1) % PerfWidget.HISTORY;
+
+        this.draw();
+        this.elements.cpu.textContent = `CPU ${metrics.cpu.usage_percent.toFixed(1)}%`;
+        this.elements.memory.textContent =
+            `MEM ${formatBytes(metrics.memory.used)}/${formatBytes(metrics.memory.total)}`;
+        this.elements.network.textContent =
+            `↓${formatBytes(metrics.network.rx_bytes_per_sec, '/s')} ` +
+            `↑${formatBytes(metrics.network.tx_bytes_per_sec, '/s')}`;
     }
 
-    drawCPU(currentPercent) {
-        const ctx = this.ctx;
-        const w = this.canvas.width;
-        const h = this.canvas.height;
+    sampleAt(index) {
+        return this.history[(this.head + index) % PerfWidget.HISTORY];
+    }
 
-        ctx.clearRect(0, 0, w, h);
+    draw() {
+        const ctx = this.context;
+        const { width, height } = this.elements.canvas;
+        const step = width / (PerfWidget.HISTORY - 1);
 
-        // Background
-        ctx.fillStyle = '#1a1a1a';
-        ctx.fillRect(0, 0, w, h);
+        ctx.fillStyle = PerfWidget.BACKGROUND;
+        ctx.fillRect(0, 0, width, height);
 
-        // Draw history as filled area
-        const step = w / (this.cpuHistory.length - 1);
         ctx.beginPath();
-        ctx.moveTo(0, h);
-
-        for (let i = 0; i < this.cpuHistory.length; i++) {
+        for (let i = 0; i < PerfWidget.HISTORY; i++) {
             const x = i * step;
-            const y = h - (this.cpuHistory[i] / 100) * h;
-            if (i === 0) {
-                ctx.lineTo(x, y);
-            } else {
-                ctx.lineTo(x, y);
-            }
-        }
-
-        ctx.lineTo(w, h);
-        ctx.closePath();
-
-        // Gradient fill
-        const grad = ctx.createLinearGradient(0, 0, 0, h);
-        grad.addColorStop(0, 'rgba(74, 158, 255, 0.6)');
-        grad.addColorStop(1, 'rgba(74, 158, 255, 0.1)');
-        ctx.fillStyle = grad;
-        ctx.fill();
-
-        // Top line
-        ctx.beginPath();
-        for (let i = 0; i < this.cpuHistory.length; i++) {
-            const x = i * step;
-            const y = h - (this.cpuHistory[i] / 100) * h;
+            const y = height - (this.sampleAt(i) / 100) * height;
             if (i === 0) ctx.moveTo(x, y);
             else ctx.lineTo(x, y);
         }
-        ctx.strokeStyle = '#4a9eff';
+
+        ctx.strokeStyle = PerfWidget.LINE;
         ctx.lineWidth = 1.5;
         ctx.stroke();
 
-        // Update text
-        document.getElementById('cpu-text').textContent = `CPU ${currentPercent.toFixed(1)}%`;
-    }
+        ctx.lineTo(width, height);
+        ctx.lineTo(0, height);
+        ctx.closePath();
 
-    formatBytes(bytes) {
-        if (bytes === 0) return '0 B';
-        const k = 1024;
-        const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-        const i = Math.floor(Math.log(bytes) / Math.log(k));
-        const val = (bytes / Math.pow(k, i)).toFixed(i > 1 ? 1 : 0);
-        return val + sizes[i];
-    }
-
-    formatSpeed(bytesPerSec) {
-        if (bytesPerSec === 0) return '0 B/s';
-        const k = 1024;
-        const sizes = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
-        const i = Math.floor(Math.log(bytesPerSec) / Math.log(k));
-        const val = (bytesPerSec / Math.pow(k, i)).toFixed(i > 0 ? 1 : 0);
-        return val + ' ' + sizes[i];
+        const gradient = ctx.createLinearGradient(0, 0, 0, height);
+        gradient.addColorStop(0, PerfWidget.FILL_TOP);
+        gradient.addColorStop(1, PerfWidget.FILL_BOTTOM);
+        ctx.fillStyle = gradient;
+        ctx.fill();
     }
 }
-
-window.perfWidget = new PerfWidget();

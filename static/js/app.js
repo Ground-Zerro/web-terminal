@@ -1,765 +1,443 @@
-// Main Application
 class App {
+    static START_PATH = '/root/';
+    static AUTOCOMPLETE_DELAY = 200;
+    static PANEL_TRANSITION = 320;
+    static MOBILE_WIDTH = 768;
+
     constructor() {
-        this.token = null;
-        this.terminalManager = null;
+        this.settings = new Settings('webterminal.');
+        this.session = new Session(sessionStorage);
+        this.api = new ApiClient(this.session, () => this.teardown());
+
+        this.elements = App.collectElements();
         this.currentPath = '/';
-        this.sortField = this.getCookie('sortField') || 'name';
-        this.sortAsc = this.getCookie('sortAsc') !== 'false';
-        this.files = [];
+        this.suggestionIndex = -1;
+        this.suggestTimer = null;
+        this.terminal = null;
+        this.perf = null;
 
-        // Initialize
-        this.init();
+        this.fileList = new FileListView(this.elements.fileList, {
+            onOpen: (path) => this.loadFiles(path),
+            onDownload: (path, isDir) => this.download(path, isDir),
+            onDelete: (path, name, isDir) => this.deleteItem(path, name, isDir),
+            onInsertPath: (path) => this.terminal?.send(path)
+        });
+        this.fileList.setSort(
+            this.settings.get('sortField', 'name'),
+            this.settings.get('sortAsc', 'true') !== 'false'
+        );
+
+        this.bindEvents();
+        this.updateSortUI();
+
+        if (this.session.token) this.showApp();
+        else this.showLogin();
     }
 
-    init() {
-        // Check for existing session
-        this.token = sessionStorage.getItem('token');
-        if (this.token) {
-            this.showApp();
-        } else {
-            this.showLogin();
-        }
-
-        // Setup event listeners
-        this.setupEventListeners();
+    static collectElements() {
+        const ids = [
+            'login-screen', 'app', 'login-form', 'login', 'password', 'login-error',
+            'logout-btn', 'user-info', 'refresh-files', 'new-folder', 'current-path',
+            'path-autocomplete', 'file-list', 'file-input', 'upload-area',
+            'upload-progress', 'progress-bar', 'progress-text', 'clear-terminal',
+            'toggle-files', 'panel-overlay', 'terminal', 'terminal-keys',
+            'cpu-graph', 'cpu-text', 'mem-text', 'net-text'
+        ];
+        const camel = (id) => id.replace(/-(\w)/g, (_, c) => c.toUpperCase());
+        return Object.fromEntries(ids.map((id) => [camel(id), document.getElementById(id)]));
     }
 
-    setupEventListeners() {
-        // Login form
-        document.getElementById('login-form').addEventListener('submit', (e) => {
-            e.preventDefault();
+    bindEvents() {
+        const el = this.elements;
+
+        el.loginForm.addEventListener('submit', (event) => {
+            event.preventDefault();
             this.login();
         });
+        el.logoutBtn.addEventListener('click', () => this.logout());
 
-        // Logout button
-        document.getElementById('logout-btn').addEventListener('click', () => {
-            this.logout();
-        });
+        el.refreshFiles.addEventListener('click', () => this.loadFiles(this.currentPath));
+        el.newFolder.addEventListener('click', () => this.createFolder());
+        el.clearTerminal.addEventListener('click', () => this.terminal?.clear());
 
-        // File browser
-        document.getElementById('refresh-files').addEventListener('click', () => {
-            this.loadFiles(this.currentPath);
-        });
+        for (const field of ['name', 'size', 'date']) {
+            document.getElementById(`sort-${field}`)
+                .addEventListener('click', () => this.toggleSort(field));
+        }
 
-        document.getElementById('new-folder').addEventListener('click', () => {
-            this.createNewFolder();
-        });
-
-        // Sort buttons
-        document.getElementById('sort-name').addEventListener('click', () => {
-            this.toggleSort('name');
-        });
-        document.getElementById('sort-size').addEventListener('click', () => {
-            this.toggleSort('size');
-        });
-        document.getElementById('sort-date').addEventListener('click', () => {
-            this.toggleSort('date');
-        });
-
-        // Path input — Enter to navigate, typing triggers autocomplete
-        const pathInput = document.getElementById('current-path');
-        const pathAutocomplete = document.getElementById('path-autocomplete');
-        let autocompleteTimeout = null;
-        let selectedSuggestion = -1;
-
-        pathInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                this.loadFiles(pathInput.value || '/');
-                pathAutocomplete.classList.remove('active');
-                return;
-            }
-            if (e.key === 'Escape') {
-                pathAutocomplete.classList.remove('active');
-                return;
-            }
-            // Arrow navigation in autocomplete
-            const items = pathAutocomplete.querySelectorAll('.path-suggestion');
-            if (items.length > 0) {
-                if (e.key === 'ArrowDown') {
-                    e.preventDefault();
-                    selectedSuggestion = Math.min(selectedSuggestion + 1, items.length - 1);
-                    items.forEach((el, i) => el.classList.toggle('selected', i === selectedSuggestion));
-                    return;
-                }
-                if (e.key === 'ArrowUp') {
-                    e.preventDefault();
-                    selectedSuggestion = Math.max(selectedSuggestion - 1, 0);
-                    items.forEach((el, i) => el.classList.toggle('selected', i === selectedSuggestion));
-                    return;
-                }
-                if (e.key === 'Tab' && selectedSuggestion >= 0) {
-                    e.preventDefault();
-                    pathInput.value = items[selectedSuggestion].dataset.path;
-                    pathAutocomplete.classList.remove('active');
-                    return;
-                }
+        el.currentPath.addEventListener('keydown', (event) => this.onPathKey(event));
+        el.currentPath.addEventListener('input', () => this.onPathInput());
+        el.currentPath.addEventListener('focus', () => {
+            if (el.pathAutocomplete.childElementCount && el.currentPath.value.trim()) {
+                el.pathAutocomplete.classList.add('active');
             }
         });
-
-        pathInput.addEventListener('input', () => {
-            clearTimeout(autocompleteTimeout);
-            selectedSuggestion = -1;
-            const val = pathInput.value.trim();
-            if (!val) {
-                pathAutocomplete.classList.remove('active');
-                return;
-            }
-            autocompleteTimeout = setTimeout(() => this.suggestPath(val), 200);
+        el.pathAutocomplete.addEventListener('click', (event) => {
+            const suggestion = event.target.closest('.path-suggestion');
+            if (!suggestion) return;
+            el.currentPath.value = suggestion.dataset.path;
+            this.closeSuggestions();
+            this.loadFiles(suggestion.dataset.path);
+        });
+        document.addEventListener('click', (event) => {
+            if (!event.target.closest('.file-browser-path')) this.closeSuggestions();
         });
 
-        pathInput.addEventListener('focus', () => {
-            if (pathAutocomplete.children.length > 0 && pathInput.value.trim()) {
-                pathAutocomplete.classList.add('active');
-            }
+        el.fileInput.addEventListener('change', (event) => {
+            this.uploadAll([...event.target.files].map((file) => ({ file, path: this.currentPath })));
+            event.target.value = '';
         });
 
-        // Click outside to close autocomplete
-        document.addEventListener('click', (e) => {
-            if (!e.target.closest('.file-browser-path')) {
-                pathAutocomplete.classList.remove('active');
-            }
-        });
+        for (const type of ['dragover', 'dragleave', 'drop']) {
+            el.uploadArea.addEventListener(type, (event) => this.onDrag(type, event));
+        }
 
-        // File upload
-        const fileInput = document.getElementById('file-input');
-        const uploadArea = document.getElementById('upload-area');
-
-        fileInput.addEventListener('change', (e) => {
-            this.uploadFiles(e.target.files);
-        });
-
-        // Drag and drop -支持文件和文件夹
-        uploadArea.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            uploadArea.classList.add('dragover');
-        });
-
-        uploadArea.addEventListener('dragleave', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            uploadArea.classList.remove('dragover');
-        });
-
-        uploadArea.addEventListener('drop', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            uploadArea.classList.remove('dragover');
-
-            const items = e.dataTransfer.items;
-            if (items) {
-                this.uploadItems(items);
-            } else {
-                this.uploadFiles(e.dataTransfer.files);
-            }
-        });
-
-        // Terminal clear button
-        document.getElementById('clear-terminal').addEventListener('click', () => {
-            if (this.terminalManager) {
-                this.terminalManager.clear();
-            }
-        });
-
-        // Mobile file panel toggle
-        document.getElementById('toggle-files').addEventListener('click', () => {
-            this.toggleFilePanel();
-        });
-        document.getElementById('panel-overlay').addEventListener('click', () => {
-            this.closeFilePanel();
-        });
-
-        // Initialize sort UI
-        this.updateSortUI();
+        el.toggleFiles.addEventListener('click', () => this.toggleFilePanel());
+        el.panelOverlay.addEventListener('click', () => this.closeFilePanel());
     }
 
     showLogin() {
-        document.getElementById('login-screen').style.display = 'flex';
-        document.getElementById('app').style.display = 'none';
+        this.elements.loginScreen.style.display = 'flex';
+        this.elements.app.style.display = 'none';
     }
 
     showApp() {
-        document.getElementById('login-screen').style.display = 'none';
-        document.getElementById('app').style.display = 'flex';
+        this.elements.loginScreen.style.display = 'none';
+        this.elements.app.style.display = 'flex';
+        this.elements.userInfo.textContent = this.session.user;
 
-        // Initialize terminal
-        this.terminalManager = new TerminalManager();
-        this.terminalManager.init(this.token);
+        this.terminal = new TerminalManager(this.session);
+        this.terminal.init(this.elements.terminal, this.elements.terminalKeys);
 
-        // Start performance widget
-        window.perfWidget.start(this.token);
+        this.perf = new PerfWidget(this.api, {
+            canvas: this.elements.cpuGraph,
+            cpu: this.elements.cpuText,
+            memory: this.elements.memText,
+            network: this.elements.netText
+        });
+        this.perf.start();
 
-        // Load files
-        this.loadFiles('/root/');
+        this.loadFiles(App.START_PATH);
     }
 
     async login() {
-        const login = document.getElementById('login').value;
-        const password = document.getElementById('password').value;
-        const errorDiv = document.getElementById('login-error');
-
+        const { loginError } = this.elements;
         try {
-            const response = await fetch('api/login', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ login, password })
+            const data = await this.api.post('api/login', {
+                login: this.elements.login.value,
+                password: this.elements.password.value
             });
-
-            const data = await response.json();
-
-            if (data.success) {
-                this.token = data.token;
-                sessionStorage.setItem('token', this.token);
-                this.showApp();
-            } else {
-                errorDiv.textContent = data.error || 'Login failed';
-                errorDiv.style.display = 'block';
-            }
+            this.session.start(data.token, data.user);
+            loginError.style.display = 'none';
+            this.elements.password.value = '';
+            this.showApp();
         } catch (error) {
-            errorDiv.textContent = 'Connection error';
-            errorDiv.style.display = 'block';
+            loginError.textContent = error.message;
+            loginError.style.display = 'block';
         }
     }
 
     async logout() {
         try {
-            await fetch('api/logout', {
-                method: 'POST',
-                headers: {
-                    'Authorization': this.token,
-                }
-            });
+            await this.api.signal('api/logout');
         } catch (error) {
             console.error('Logout error:', error);
         }
+        this.teardown();
+    }
 
-        // Stop performance widget
-        window.perfWidget.stop();
+    teardown() {
+        if (!this.session.token) return;
 
-        // Disconnect terminal
-        if (this.terminalManager) {
-            this.terminalManager.disconnect();
-        }
+        this.perf?.stop();
+        this.terminal?.disconnect();
+        this.perf = null;
+        this.terminal = null;
 
-        // Clear token
-        this.token = null;
-        sessionStorage.removeItem('token');
-
-        // Show login
+        this.session.clear();
         this.showLogin();
     }
 
     async loadFiles(path) {
         try {
-            const response = await fetch(`api/files?path=${encodeURIComponent(path)}`, {
-                headers: {
-                    'Authorization': this.token,
-                }
-            });
-
-            const data = await response.json();
-
-            if (data.success) {
-                this.currentPath = data.path;
-                document.getElementById('current-path').value = data.path;
-                this.files = data.files;
-                this.renderFiles();
-                if (window.innerWidth <= 768) {
-                    this.closeFilePanel();
-                }
-            }
+            const data = await this.api.get('api/files', { path });
+            this.currentPath = data.path;
+            this.elements.currentPath.value = data.path;
+            this.fileList.setEntries(data.path, data.files);
+            this.fileList.render();
+            if (window.innerWidth <= App.MOBILE_WIDTH) this.closeFilePanel();
         } catch (error) {
-            console.error('Load files error:', error);
+            this.report(error);
         }
     }
 
-    async suggestPath(input) {
-        const autocomplete = document.getElementById('path-autocomplete');
-        autocomplete.innerHTML = '';
+    onPathKey(event) {
+        const { currentPath, pathAutocomplete } = this.elements;
 
-        // Determine parent directory and prefix to match
-        let parentDir, prefix;
-        if (input.endsWith('/')) {
-            parentDir = input.slice(0, -1) || '/';
-            prefix = '';
-        } else {
-            const parts = input.split('/');
-            prefix = parts.pop();
-            parentDir = parts.join('/') || '/';
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            this.closeSuggestions();
+            this.loadFiles(currentPath.value || '/');
+            return;
+        }
+        if (event.key === 'Escape') {
+            this.closeSuggestions();
+            return;
         }
 
+        const items = pathAutocomplete.children;
+        if (!items.length) return;
+
+        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+            event.preventDefault();
+            const delta = event.key === 'ArrowDown' ? 1 : -1;
+            this.highlight(Math.min(Math.max(this.suggestionIndex + delta, 0), items.length - 1));
+            return;
+        }
+        if (event.key === 'Tab' && this.suggestionIndex >= 0) {
+            event.preventDefault();
+            currentPath.value = items[this.suggestionIndex].dataset.path;
+            this.closeSuggestions();
+        }
+    }
+
+    onPathInput() {
+        clearTimeout(this.suggestTimer);
+        this.suggestionIndex = -1;
+
+        const value = this.elements.currentPath.value.trim();
+        if (!value) {
+            this.closeSuggestions();
+            return;
+        }
+        this.suggestTimer = setTimeout(() => this.suggest(value), App.AUTOCOMPLETE_DELAY);
+    }
+
+    highlight(index) {
+        this.suggestionIndex = index;
+        const items = this.elements.pathAutocomplete.children;
+        for (let i = 0; i < items.length; i++) {
+            items[i].classList.toggle('selected', i === index);
+        }
+    }
+
+    closeSuggestions() {
+        this.suggestionIndex = -1;
+        this.elements.pathAutocomplete.classList.remove('active');
+    }
+
+    async suggest(input) {
+        const separator = input.lastIndexOf('/');
+        const parent = separator < 0 ? '/' : input.slice(0, separator) || '/';
+        const prefix = input.slice(separator + 1).toLowerCase();
+
+        let data;
         try {
-            const response = await fetch(`api/files?path=${encodeURIComponent(parentDir)}`, {
-                headers: { 'Authorization': this.token }
-            });
-            const data = await response.json();
-            if (!data.success) return;
-
-            const matches = data.files
-                .filter(f => f.isDir && f.name.toLowerCase().startsWith(prefix.toLowerCase()))
-                .map(f => {
-                    const fullPath = parentDir === '/' ? `/${f.name}` : `${parentDir}/${f.name}`;
-                    return { name: f.name, path: fullPath + '/' };
-                })
-                .sort((a, b) => a.name.localeCompare(b.name));
-
-            if (matches.length === 0) {
-                autocomplete.classList.remove('active');
-                return;
-            }
-
-            matches.forEach(m => {
-                const div = document.createElement('div');
-                div.className = 'path-suggestion';
-                div.textContent = m.path;
-                div.dataset.path = m.path;
-                div.addEventListener('click', () => {
-                    document.getElementById('current-path').value = m.path;
-                    autocomplete.classList.remove('active');
-                    this.loadFiles(m.path);
-                });
-                autocomplete.appendChild(div);
-            });
-
-            autocomplete.classList.add('active');
-        } catch (e) {
-            // silent
+            data = await this.api.get('api/files', { path: parent });
+        } catch (error) {
+            this.closeSuggestions();
+            return;
         }
+
+        const matches = data.files
+            .filter((entry) => entry.isDir && entry.name.toLowerCase().startsWith(prefix))
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+        if (!matches.length) {
+            this.closeSuggestions();
+            return;
+        }
+
+        const fragment = document.createDocumentFragment();
+        for (const entry of matches) {
+            const suggestion = document.createElement('div');
+            suggestion.className = 'path-suggestion';
+            suggestion.dataset.path = `${entry.path}/`;
+            suggestion.textContent = `${entry.path}/`;
+            fragment.appendChild(suggestion);
+        }
+
+        this.elements.pathAutocomplete.replaceChildren(fragment);
+        this.elements.pathAutocomplete.classList.add('active');
+        this.suggestionIndex = -1;
     }
 
-    // Sort functions
     toggleSort(field) {
-        if (this.sortField === field) {
-            this.sortAsc = !this.sortAsc;
-        } else {
-            this.sortField = field;
-            this.sortAsc = true;
-        }
+        const ascending = this.fileList.field === field ? !this.fileList.ascending : true;
+        this.fileList.setSort(field, ascending);
 
-        // Save to cookies
-        this.setCookie('sortField', this.sortField, 365);
-        this.setCookie('sortAsc', this.sortAsc.toString(), 365);
+        this.settings.set('sortField', field);
+        this.settings.set('sortAsc', ascending);
 
         this.updateSortUI();
-        this.renderFiles();
+        this.fileList.render();
     }
 
     updateSortUI() {
-        // Reset all sort buttons
-        document.querySelectorAll('.sort-btn').forEach(btn => {
-            btn.classList.remove('active', 'asc', 'desc');
-        });
-
-        // Set active sort button
-        const activeBtn = document.getElementById(`sort-${this.sortField}`);
-        if (activeBtn) {
-            activeBtn.classList.add('active');
-            activeBtn.classList.add(this.sortAsc ? 'asc' : 'desc');
+        for (const button of document.querySelectorAll('.sort-btn')) {
+            button.classList.remove('active', 'asc', 'desc');
         }
+        const active = document.getElementById(`sort-${this.fileList.field}`);
+        active?.classList.add('active', this.fileList.ascending ? 'asc' : 'desc');
     }
 
-    sortFiles(files) {
-        const sorted = [...files];
+    onDrag(type, event) {
+        event.preventDefault();
+        event.stopPropagation();
 
-        // Separate directories and files
-        const dirs = sorted.filter(f => f.isDir);
-        const fileItems = sorted.filter(f => !f.isDir);
-
-        // Sort function
-        const compare = (a, b) => {
-            let result = 0;
-
-            switch (this.sortField) {
-                case 'name':
-                    result = a.name.localeCompare(b.name);
-                    break;
-                case 'size':
-                    result = (a.size || 0) - (b.size || 0);
-                    break;
-                case 'date':
-                    result = new Date(a.modTime || 0) - new Date(b.modTime || 0);
-                    break;
-            }
-
-            return this.sortAsc ? result : -result;
-        };
-
-        // Sort directories and files separately
-        dirs.sort(compare);
-        fileItems.sort(compare);
-
-        // Return dirs first, then files
-        return [...dirs, ...fileItems];
-    }
-
-    renderFiles() {
-        const fileList = document.getElementById('file-list');
-        fileList.innerHTML = '';
-
-        // Add parent directory link
-        if (this.currentPath !== '/') {
-            const parentPath = this.currentPath.split('/').slice(0, -1).join('/') || '/';
-            const parentItem = this.createFileItem({
-                name: '..',
-                path: parentPath,
-                isDir: true
-            });
-            fileList.appendChild(parentItem);
+        const { uploadArea } = this.elements;
+        if (type === 'dragover') {
+            uploadArea.classList.add('dragover');
+            return;
         }
 
-        // Sort and add files
-        const sortedFiles = this.sortFiles(this.files);
-        sortedFiles.forEach(file => {
-            const fileItem = this.createFileItem(file);
-            fileList.appendChild(fileItem);
-        });
+        uploadArea.classList.remove('dragover');
+        if (type === 'drop') this.uploadDrop(event.dataTransfer);
     }
 
-    createFileItem(file) {
-        const div = document.createElement('div');
-        div.className = 'file-item';
+    async uploadDrop(transfer) {
+        if (!transfer.items) {
+            this.uploadAll([...transfer.files].map((file) => ({ file, path: this.currentPath })));
+            return;
+        }
 
-        const icon = file.isDir ? '📁' : this.getFileIcon(file.name);
-        const size = file.isDir ? '' : this.formatSize(file.size);
-
-        div.innerHTML = `
-            <span class="file-icon">${icon}</span>
-            <div class="file-info">
-                <div class="file-name" title="${file.name}">${file.name}</div>
-                <div class="file-meta">${size} ${file.modTime || ''}</div>
-            </div>
-            <div class="file-actions">
-                ${file.isDir
-                    ? `<button class="btn-download" onclick="app.downloadFolder('${file.path}')" title="Download as ZIP">📦</button>`
-                    : `<button class="btn-download" onclick="app.downloadFile('${file.path}')" title="Download">⬇</button>`
-                }
-                <button class="btn-delete" onclick="app.deleteItem('${file.path}', '${file.name}', ${file.isDir})">🗑️</button>
-            </div>
-        `;
-
-        // Click to navigate
-        div.addEventListener('click', (e) => {
-            if (e.target.classList.contains('btn-download') || e.target.classList.contains('btn-delete')) {
-                return;
-            }
-            if (file.isDir) {
-                this.loadFiles(file.path);
-            }
-        });
-
-        // Middle click — paste path into terminal
-        div.addEventListener('mousedown', (e) => {
-            if (e.button === 1) {
-                e.preventDefault();
-                if (this.terminalManager) {
-                    this.terminalManager.sendText(file.path + (file.isDir ? '/' : ''));
-                }
-            }
-        });
-
-        return div;
-    }
-
-    getFileIcon(filename) {
-        const ext = filename.split('.').pop().toLowerCase();
-        const icons = {
-            'js': '📜',
-            'ts': '📜',
-            'py': '🐍',
-            'go': '🔵',
-            'rs': '🦀',
-            'java': '☕',
-            'c': '⚙️',
-            'cpp': '⚙️',
-            'h': '📄',
-            'html': '🌐',
-            'css': '🎨',
-            'json': '📋',
-            'xml': '📋',
-            'yaml': '📋',
-            'yml': '📋',
-            'md': '📝',
-            'txt': '📝',
-            'log': '📋',
-            'sh': '🐚',
-            'bash': '🐚',
-            'zip': '📦',
-            'tar': '📦',
-            'gz': '📦',
-            'jpg': '🖼️',
-            'jpeg': '🖼️',
-            'png': '🖼️',
-            'gif': '🖼️',
-            'svg': '🖼️',
-            'mp3': '🎵',
-            'mp4': '🎬',
-            'pdf': '📄',
-            'doc': '📄',
-            'docx': '📄',
-            'xls': '📊',
-            'xlsx': '📊'
-        };
-        return icons[ext] || '📄';
-    }
-
-    formatSize(bytes) {
-        if (bytes === 0) return '0 B';
-        const k = 1024;
-        const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-        const i = Math.floor(Math.log(bytes) / Math.log(k));
-        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-    }
-
-    // Upload items (supports both files and folders)
-    async uploadItems(items) {
-        const entries = [];
         const queue = [];
-
-        // Process items
-        for (let i = 0; i < items.length; i++) {
-            const item = items[i];
-            if (item.kind === 'file') {
-                const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
-                if (entry) {
-                    queue.push({ entry, path: this.currentPath });
-                } else {
-                    // Fallback for browsers withoutwebkitGetAsEntry
-                    const file = item.getAsFile();
-                    if (file) {
-                        entries.push({ file, path: this.currentPath });
-                    }
-                }
+        for (const item of transfer.items) {
+            if (item.kind !== 'file') continue;
+            const entry = item.webkitGetAsEntry?.();
+            if (entry) queue.push({ entry, path: this.currentPath });
+            else {
+                const file = item.getAsFile();
+                if (file) queue.push({ file, path: this.currentPath });
             }
         }
 
-        // Process directory entries recursively
-        while (queue.length > 0) {
-            const { entry, path } = queue.shift();
+        this.uploadAll(await App.flatten(queue));
+    }
+
+    static async flatten(queue) {
+        const files = [];
+
+        while (queue.length) {
+            const { entry, file, path } = queue.shift();
+            if (file) {
+                files.push({ file, path });
+                continue;
+            }
 
             if (entry.isFile) {
-                const file = await new Promise((resolve) => entry.file(resolve));
-                entries.push({ file, path });
-            } else if (entry.isDirectory) {
-                const dirReader = entry.createReader();
-                const dirEntries = await new Promise((resolve) => {
-                    const allEntries = [];
-                    const readEntries = () => {
-                        dirReader.readEntries((ents) => {
-                            if (ents.length === 0) {
-                                resolve(allEntries);
-                            } else {
-                                allEntries.push(...ents);
-                                readEntries();
-                            }
-                        });
-                    };
-                    readEntries();
-                });
+                files.push({ file: await new Promise((resolve) => entry.file(resolve)), path });
+                continue;
+            }
 
-                // Add subdirectory to queue
-                const newPath = path === '/' ? `/${entry.name}` : `${path}/${entry.name}`;
-                for (const subEntry of dirEntries) {
-                    queue.push({ entry: subEntry, path: newPath });
-                }
+            const childPath = path === '/' ? `/${entry.name}` : `${path}/${entry.name}`;
+            for (const child of await App.readDirectory(entry)) {
+                queue.push({ entry: child, path: childPath });
             }
         }
 
-        // Upload all files with progress
-        if (entries.length > 0) {
-            this.showProgress(`${entries.length} file(s)`);
-            for (let i = 0; i < entries.length; i++) {
-                const { file, path } = entries[i];
-                document.getElementById('progress-text').textContent =
-                    `Uploading ${i + 1}/${entries.length}: ${file.name}`;
-                await this.uploadFile(file, path);
-            }
-            this.hideProgress();
-        }
-
-        // Refresh file list
-        this.loadFiles(this.currentPath);
+        return files;
     }
 
-    async uploadFiles(files) {
-        if (files.length > 0) {
-            this.showProgress(`${files.length} file(s)`);
-            for (let i = 0; i < files.length; i++) {
-                document.getElementById('progress-text').textContent =
-                    `Uploading ${i + 1}/${files.length}: ${files[i].name}`;
-                await this.uploadFile(files[i], this.currentPath);
-            }
-            this.hideProgress();
-        }
-        this.loadFiles(this.currentPath);
-    }
-
-    async uploadFile(file, path) {
+    static readDirectory(entry) {
+        const reader = entry.createReader();
+        const entries = [];
         return new Promise((resolve) => {
-            const formData = new FormData();
-            formData.append('file', file);
-            formData.append('path', path);
-
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', 'api/files/upload');
-            xhr.setRequestHeader('Authorization', this.token);
-
-            xhr.upload.onprogress = (e) => {
-                if (e.lengthComputable) {
-                    const pct = Math.round((e.loaded / e.total) * 100);
-                    this.updateProgress(pct, file.name);
+            const readBatch = () => reader.readEntries((batch) => {
+                if (!batch.length) resolve(entries);
+                else {
+                    entries.push(...batch);
+                    readBatch();
                 }
-            };
-
-            xhr.onload = () => {
-                try {
-                    const data = JSON.parse(xhr.responseText);
-                    if (!data.success) {
-                        console.error('Upload error:', data.error, 'path:', path, 'file:', file.name);
-                    }
-                } catch (e) {
-                    console.error('Upload parse error:', xhr.responseText);
-                }
-                resolve();
-            };
-
-            xhr.onerror = () => {
-                console.error('Upload network error:', file.name, 'to', path);
-                resolve();
-            };
-
-            xhr.send(formData);
+            });
+            readBatch();
         });
     }
 
-    showProgress(fileName) {
-        const el = document.getElementById('upload-progress');
-        el.classList.add('active');
-        document.getElementById('progress-text').textContent = `Uploading ${fileName}...`;
-        document.getElementById('progress-bar').style.width = '0%';
+    async uploadAll(files) {
+        if (!files.length) return;
+
+        this.elements.uploadProgress.classList.add('active');
+        const failures = [];
+
+        for (let i = 0; i < files.length; i++) {
+            const { file, path } = files[i];
+            const label = `${i + 1}/${files.length}: ${file.name}`;
+            this.setProgress(0, label);
+            try {
+                await this.api.upload('api/files/upload', file, path,
+                    (percent) => this.setProgress(percent, label));
+            } catch (error) {
+                failures.push(`${file.name}: ${error.message}`);
+            }
+        }
+
+        this.elements.uploadProgress.classList.remove('active');
+        if (failures.length) alert(`Upload failed:\n${failures.join('\n')}`);
+        this.loadFiles(this.currentPath);
     }
 
-    updateProgress(pct, fileName) {
-        document.getElementById('progress-bar').style.width = pct + '%';
-        document.getElementById('progress-text').textContent = `Uploading ${fileName} — ${pct}%`;
-    }
-
-    hideProgress() {
-        document.getElementById('upload-progress').classList.remove('active');
+    setProgress(percent, label) {
+        this.elements.progressBar.style.width = `${percent}%`;
+        this.elements.progressText.textContent = `Uploading ${label} — ${percent}%`;
     }
 
     toggleFilePanel() {
         const panel = document.querySelector('.file-browser');
-        const overlay = document.getElementById('panel-overlay');
         if (panel.classList.contains('open')) {
             this.closeFilePanel();
-        } else {
-            panel.classList.add('open');
-            overlay.classList.add('active');
+            return;
         }
+        panel.classList.add('open');
+        this.elements.panelOverlay.classList.add('active');
     }
 
     closeFilePanel() {
         document.querySelector('.file-browser').classList.remove('open');
-        document.getElementById('panel-overlay').classList.remove('active');
-        setTimeout(() => window.dispatchEvent(new Event('resize')), 320);
+        this.elements.panelOverlay.classList.remove('active');
+        this.terminal?.scheduleFit(App.PANEL_TRANSITION);
     }
 
-    downloadFile(path) {
+    download(path, isDir) {
+        const endpoint = isDir ? 'api/files/download-folder' : 'api/files/download';
         const link = document.createElement('a');
-        link.href = `api/files/download?path=${encodeURIComponent(path)}`;
+        link.href = this.api.downloadUrl(endpoint, { path });
         link.download = '';
         document.body.appendChild(link);
         link.click();
-        document.body.removeChild(link);
+        link.remove();
     }
 
-    downloadFolder(path) {
-        const link = document.createElement('a');
-        link.href = `api/files/download-folder?path=${encodeURIComponent(path)}`;
-        link.download = '';
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-    }
-
-    async createNewFolder() {
+    async createFolder() {
         const name = prompt('Enter folder name:');
-        if (name) {
-            try {
-                const response = await fetch('api/files/mkdir', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': this.token,
-                    },
-                    body: JSON.stringify({
-                        path: this.currentPath,
-                        name: name
-                    })
-                });
+        if (!name) return;
 
-                const data = await response.json();
-                if (data.success) {
-                    this.loadFiles(this.currentPath);
-                } else {
-                    alert(data.error || 'Failed to create folder');
-                }
-            } catch (error) {
-                console.error('Create folder error:', error);
-                alert('Failed to create folder');
-            }
+        try {
+            await this.api.post('api/files/mkdir', { path: this.currentPath, name });
+            this.loadFiles(this.currentPath);
+        } catch (error) {
+            this.report(error);
         }
     }
 
     async deleteItem(path, name, isDir) {
-        const type = isDir ? 'folder' : 'file';
-        const confirmMsg = isDir
+        const question = isDir
             ? `Delete folder "${name}" and all its contents?`
             : `Delete file "${name}"?`;
-
-        if (!confirm(confirmMsg)) {
-            return;
-        }
+        if (!confirm(question)) return;
 
         try {
-            const response = await fetch('api/files/delete', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': this.token,
-                },
-                body: JSON.stringify({ path })
-            });
-
-            const data = await response.json();
-            if (data.success) {
-                this.loadFiles(this.currentPath);
-            } else {
-                alert(data.error || 'Failed to delete');
-            }
+            await this.api.post('api/files/delete', { path });
+            this.loadFiles(this.currentPath);
         } catch (error) {
-            console.error('Delete error:', error);
-            alert('Failed to delete');
+            this.report(error);
         }
     }
 
-    // Cookie helpers
-    setCookie(name, value, days) {
-        const expires = new Date(Date.now() + days * 864e5).toUTCString();
-        document.cookie = `${name}=${encodeURIComponent(value)}; expires=${expires}; path=/`;
-    }
-
-    getCookie(name) {
-        return document.cookie.split('; ').reduce((r, v) => {
-            const parts = v.split('=');
-            return parts[0] === name ? decodeURIComponent(parts[1]) : r;
-        }, '');
+    report(error) {
+        console.error(error);
+        alert(error.message);
     }
 }
 
-// Initialize app
-const app = new App();
+new App();

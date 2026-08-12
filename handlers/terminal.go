@@ -1,12 +1,16 @@
 package handlers
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,48 +18,68 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// TerminalHandler handles WebSocket terminal connections
+const (
+	wsBufferSize  = 16 << 10
+	ptyBufferSize = 64 << 10
+	pingPeriod    = 30 * time.Second
+	writeWait     = 10 * time.Second
+	defaultCols   = 80
+	defaultRows   = 24
+)
+
+var (
+	pingFrame = []byte("ping")
+	pongFrame = []byte("pong")
+
+	shellEnv = []string{
+		"TERM=xterm-256color",
+		"COLORTERM=truecolor",
+		"LANG=C.UTF-8",
+		"LC_ALL=C.UTF-8",
+		"LC_CTYPE=C.UTF-8",
+		"TERM_PROGRAM=",
+	}
+)
+
 type TerminalHandler struct {
-	upgrader     websocket.Upgrader
-	terminalDir  string
+	upgrader    websocket.Upgrader
+	terminalDir string
 }
 
-// TerminalMessage represents a message sent over WebSocket
-type TerminalMessage struct {
-	Type string      `json:"type"`
-	Data interface{} `json:"data"`
+type terminalMessage struct {
+	Type string          `json:"type"`
+	Data json.RawMessage `json:"data"`
 }
 
-// TerminalSize represents terminal dimensions
-type TerminalSize struct {
-	Cols int `json:"cols"`
-	Rows int `json:"rows"`
+type terminalSize struct {
+	Cols uint16 `json:"cols"`
+	Rows uint16 `json:"rows"`
 }
 
-// NewTerminalHandler creates a new terminal handler
 func NewTerminalHandler(terminalDir string) *TerminalHandler {
 	return &TerminalHandler{
 		terminalDir: terminalDir,
 		upgrader: websocket.Upgrader{
-			ReadBufferSize:  16 * 1024,
-			WriteBufferSize: 16 * 1024,
-			CheckOrigin: func(r *http.Request) bool {
-				return true
-			},
+			ReadBufferSize:  wsBufferSize,
+			WriteBufferSize: wsBufferSize,
+			CheckOrigin:     sameOrigin,
 		},
 	}
 }
 
-// HandleWebSocket handles WebSocket connections for terminal
-func (h *TerminalHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Validate token
-	token := r.URL.Query().Get("token")
-	if token == "" {
-		http.Error(w, "Missing token", http.StatusUnauthorized)
-		return
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
 	}
+	parsed, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsed.Host, r.Host)
+}
 
-	// Upgrade to WebSocket
+func (h *TerminalHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("WebSocket upgrade failed: %v", err)
@@ -63,131 +87,137 @@ func (h *TerminalHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request
 	}
 	defer conn.Close()
 
-	// Set up environment for proper terminal
-	env := os.Environ()
-	env = append(env,
-		"TERM=xterm-256color",
-		"COLORTERM=truecolor",
-		"LANG=C.UTF-8",
-		"LC_ALL=C.UTF-8",
-		"LC_CTYPE=C.UTF-8",
-		"TERM_PROGRAM=",
-	)
-
-	// Create PTY with proper settings
-	cmd := exec.Command("bash", "--login")
-	cmd.Dir = h.terminalDir
-	cmd.Env = env
-
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{
-		Cols: 80,
-		Rows: 24,
-	})
+	session, err := h.startShell()
 	if err != nil {
 		log.Printf("Failed to start PTY: %v", err)
 		return
 	}
-	defer ptmx.Close()
+	defer session.close()
 
-	var mu sync.Mutex
+	done := make(chan struct{})
+	defer close(done)
 
-	// Read from PTY and send to WebSocket
-	go func() {
-		buf := make([]byte, 64*1024) // 64KB buffer
-		for {
-			n, err := ptmx.Read(buf)
-			if err != nil {
-				if err != io.EOF {
-					log.Printf("PTY read error: %v", err)
-				}
+	go session.pumpOutput(conn)
+	go session.keepAlive(conn, done)
+
+	session.pumpInput(conn)
+}
+
+type shellSession struct {
+	cmd  *exec.Cmd
+	ptmx *os.File
+
+	writeMu sync.Mutex
+}
+
+func (h *TerminalHandler) startShell() (*shellSession, error) {
+	cmd := exec.Command("bash", "--login")
+	cmd.Dir = h.terminalDir
+	cmd.Env = append(os.Environ(), shellEnv...)
+
+	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: defaultCols, Rows: defaultRows})
+	if err != nil {
+		return nil, err
+	}
+	return &shellSession{cmd: cmd, ptmx: ptmx}, nil
+}
+
+func (s *shellSession) close() {
+	s.ptmx.Close()
+	if s.cmd.Process != nil {
+		s.cmd.Process.Kill()
+	}
+	s.cmd.Wait()
+}
+
+func (s *shellSession) write(conn *websocket.Conn, messageType int, payload []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	if err := conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
+		return err
+	}
+	return conn.WriteMessage(messageType, payload)
+}
+
+func (s *shellSession) pumpOutput(conn *websocket.Conn) {
+	buf := make([]byte, ptyBufferSize)
+	for {
+		n, err := s.ptmx.Read(buf)
+		if n > 0 {
+			if err := s.write(conn, websocket.BinaryMessage, buf[:n]); err != nil {
 				return
 			}
-
-			if n > 0 {
-				mu.Lock()
-				err = conn.WriteMessage(websocket.BinaryMessage, buf[:n])
-				mu.Unlock()
-
-				if err != nil {
-					log.Printf("WebSocket write error: %v", err)
-					return
-				}
-			}
 		}
-	}()
+		if err != nil {
+			if !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrClosed) {
+				log.Printf("PTY read error: %v", err)
+			}
+			conn.Close()
+			return
+		}
+	}
+}
 
-	// Server-side ping goroutine to keep connection alive through proxies
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			mu.Lock()
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				mu.Unlock()
-				log.Printf("WebSocket ping error: %v", err)
+func (s *shellSession) keepAlive(conn *websocket.Conn, done <-chan struct{}) {
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			if err := s.write(conn, websocket.PingMessage, nil); err != nil {
 				return
 			}
-			mu.Unlock()
 		}
-	}()
+	}
+}
 
-	// Read from WebSocket and write to PTY
+func (s *shellSession) pumpInput(conn *websocket.Conn) {
 	for {
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				log.Printf("WebSocket closed: %v", err)
-			} else {
+			if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				log.Printf("WebSocket read error: %v", err)
 			}
 			return
 		}
 
-		// Handle text messages (JSON commands)
-		if messageType == websocket.TextMessage {
-			text := string(message)
-
-			// Keepalive ping from client
-			if text == "ping" {
-				mu.Lock()
-				conn.WriteMessage(websocket.TextMessage, []byte("pong"))
-				mu.Unlock()
-				continue
-			}
-
-			var msg TerminalMessage
-			if err := json.Unmarshal(message, &msg); err == nil {
-				switch msg.Type {
-				case "resize":
-					var size TerminalSize
-					if data, err := json.Marshal(msg.Data); err == nil {
-						if err := json.Unmarshal(data, &size); err == nil {
-							mu.Lock()
-							pty.Setsize(ptmx, &pty.Winsize{
-								Cols: uint16(size.Cols),
-								Rows: uint16(size.Rows),
-							})
-							mu.Unlock()
-						}
-					}
-					continue
-				}
-			}
+		if messageType == websocket.TextMessage && s.handleControl(conn, message) {
+			continue
 		}
 
-		// Write binary data directly to PTY
-		if _, err := ptmx.Write(message); err != nil {
+		if _, err := s.ptmx.Write(message); err != nil {
 			log.Printf("PTY write error: %v", err)
 			return
 		}
 	}
 }
 
-// IndexHandler serves the main page
-func IndexHandler(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
+func (s *shellSession) handleControl(conn *websocket.Conn, message []byte) bool {
+	if bytes.Equal(message, pingFrame) {
+		s.write(conn, websocket.TextMessage, pongFrame)
+		return true
 	}
-	http.ServeFile(w, r, "static/index.html")
+
+	if len(message) == 0 || message[0] != '{' {
+		return false
+	}
+
+	var msg terminalMessage
+	if err := json.Unmarshal(message, &msg); err != nil || msg.Type != "resize" {
+		return false
+	}
+
+	var size terminalSize
+	if err := json.Unmarshal(msg.Data, &size); err != nil || size.Cols == 0 || size.Rows == 0 {
+		return true
+	}
+
+	if err := pty.Setsize(s.ptmx, &pty.Winsize{Cols: size.Cols, Rows: size.Rows}); err != nil {
+		log.Printf("PTY resize error: %v", err)
+	}
+	return true
 }

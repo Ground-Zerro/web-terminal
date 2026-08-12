@@ -2,215 +2,241 @@ package handlers
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 	"webterminal/middleware"
 )
 
-// Session represents a user session
-type Session struct {
-	Token     string
-	User      string
-	CreatedAt time.Time
+const (
+	tokenBytes      = 32
+	sessionSweep    = 10 * time.Minute
+	fail2banLogPerm = 0o640
+)
+
+type Credentials struct {
+	Login       string
+	Password    string
+	Fail2banLog string
+	SessionTTL  time.Duration
 }
 
-// AuthHandler handles authentication
 type AuthHandler struct {
-	bruteForce *middleware.BruteForce
-	sessions   map[string]*Session
-	mu         sync.RWMutex
-	login      string
-	password   string
+	bruteForce  *middleware.BruteForce
+	loginHash   [sha256.Size]byte
+	passHash    [sha256.Size]byte
 	fail2banLog string
+	ttl         time.Duration
+
+	mu       sync.Mutex
+	sessions map[string]time.Time
 }
 
-// NewAuthHandler creates a new authentication handler
-func NewAuthHandler(bruteForce *middleware.BruteForce, login, password, fail2banLog string) *AuthHandler {
-	return &AuthHandler{
+func NewAuthHandler(bruteForce *middleware.BruteForce, creds Credentials) *AuthHandler {
+	h := &AuthHandler{
 		bruteForce:  bruteForce,
-		sessions:    make(map[string]*Session),
-		login:       login,
-		password:    password,
-		fail2banLog: fail2banLog,
+		loginHash:   sha256.Sum256([]byte(creds.Login)),
+		passHash:    sha256.Sum256([]byte(creds.Password)),
+		fail2banLog: creds.Fail2banLog,
+		ttl:         creds.SessionTTL,
+		sessions:    make(map[string]time.Time),
 	}
+	go h.sweep()
+	return h
 }
 
-// LoginRequest represents a login request
-type LoginRequest struct {
+type loginRequest struct {
 	Login    string `json:"login"`
 	Password string `json:"password"`
 }
 
-// LoginResponse represents a login response
-type LoginResponse struct {
-	Success bool   `json:"success"`
-	Token   string `json:"token,omitempty"`
-	Error   string `json:"error,omitempty"`
+type loginResponse struct {
+	Response
+	Token string `json:"token,omitempty"`
+	User  string `json:"user,omitempty"`
 }
 
-// Login handles user login
-func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
+func (h *AuthHandler) Require(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !h.validate(requestToken(r)) {
+			fail(w, http.StatusUnauthorized, "Unauthorized")
+			return
+		}
+		next(w, r)
 	}
+}
 
-	// Get client IP
-	ip := getClientIP(r)
+func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
+	only(http.MethodPost, h.login)(w, r)
+}
 
-	// Check if IP is banned
+func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
+	only(http.MethodPost, h.logout)(w, r)
+}
+
+func (h *AuthHandler) login(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+
 	if h.bruteForce.IsBanned(ip) {
 		log.Printf("Banned IP attempted login: %s", ip)
-		writeJSON(w, http.StatusForbidden, LoginResponse{
-			Success: false,
-			Error:   "IP address is temporarily banned",
-		})
+		fail(w, http.StatusForbidden, "IP address is temporarily banned")
 		return
 	}
 
-	// Parse request
-	var req LoginRequest
+	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, LoginResponse{
-			Success: false,
-			Error:   "Invalid request",
-		})
+		fail(w, http.StatusBadRequest, "Invalid request")
 		return
 	}
 
-	// Validate credentials
-	if req.Login != h.login || req.Password != h.password {
-		// Record failed attempt
+	if !h.matches(req) {
 		h.bruteForce.RecordFailure(ip)
 		log.Printf("Failed login attempt from %s", ip)
-
-		// Log to fail2ban log file
 		h.logToFail2ban(fmt.Sprintf("FAILED LOGIN from %s", ip))
-
-		writeJSON(w, http.StatusUnauthorized, LoginResponse{
-			Success: false,
-			Error:   "Invalid credentials",
-		})
+		fail(w, http.StatusUnauthorized, "Invalid credentials")
 		return
 	}
 
-	// Reset failed attempts on successful login
 	h.bruteForce.ResetFailures(ip)
 
-	// Generate session token
 	token, err := generateToken()
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, LoginResponse{
-			Success: false,
-			Error:   "Failed to generate token",
-		})
+		log.Printf("Failed to generate token: %v", err)
+		fail(w, http.StatusInternalServerError, "Failed to generate token")
 		return
-	}
-
-	// Create session (no expiry — expires only on logout or tab close)
-	session := &Session{
-		Token:     token,
-		User:      req.Login,
-		CreatedAt: time.Now(),
 	}
 
 	h.mu.Lock()
-	h.sessions[token] = session
+	h.sessions[token] = time.Now().Add(h.ttl)
 	h.mu.Unlock()
 
 	log.Printf("Successful login from %s", ip)
-
-	writeJSON(w, http.StatusOK, LoginResponse{
-		Success: true,
-		Token:   token,
+	writeJSON(w, http.StatusOK, loginResponse{
+		Response: Response{Success: true},
+		Token:    token,
+		User:     req.Login,
 	})
 }
 
-// Logout handles user logout
-func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	token := r.Header.Get("Authorization")
-	if token != "" {
+func (h *AuthHandler) logout(w http.ResponseWriter, r *http.Request) {
+	if token := requestToken(r); token != "" {
 		h.mu.Lock()
 		delete(h.sessions, token)
 		h.mu.Unlock()
 	}
-
-	writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+	writeJSON(w, http.StatusOK, Response{Success: true})
 }
 
-// ValidateToken checks if a token is valid
-func (h *AuthHandler) ValidateToken(token string) bool {
-	h.mu.RLock()
-	_, exists := h.sessions[token]
-	h.mu.RUnlock()
-	return exists
+func (h *AuthHandler) matches(req loginRequest) bool {
+	login := sha256.Sum256([]byte(req.Login))
+	pass := sha256.Sum256([]byte(req.Password))
+	sameLogin := subtle.ConstantTimeCompare(login[:], h.loginHash[:])
+	samePass := subtle.ConstantTimeCompare(pass[:], h.passHash[:])
+	return sameLogin&samePass == 1
 }
 
-// generateToken generates a random token
-func generateToken() (string, error) {
-	bytes := make([]byte, 32)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", err
+func (h *AuthHandler) validate(token string) bool {
+	if token == "" {
+		return false
 	}
-	return hex.EncodeToString(bytes), nil
+
+	now := time.Now()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	expiry, exists := h.sessions[token]
+	if !exists {
+		return false
+	}
+	if now.After(expiry) {
+		delete(h.sessions, token)
+		return false
+	}
+
+	h.sessions[token] = now.Add(h.ttl)
+	return true
 }
 
-// getClientIP extracts client IP from request
-func getClientIP(r *http.Request) string {
-	// Check X-Forwarded-For header
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		return xff
-	}
+func (h *AuthHandler) sweep() {
+	ticker := time.NewTicker(sessionSweep)
+	defer ticker.Stop()
 
-	// Check X-Real-IP header
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-
-	// Use RemoteAddr
-	ip := r.RemoteAddr
-	if ip[:1] == "[" {
-		// IPv6
-		if idx := len(ip) - 1; ip[idx] == ']' {
-			return ip[1:idx]
+	for now := range ticker.C {
+		h.mu.Lock()
+		for token, expiry := range h.sessions {
+			if now.After(expiry) {
+				delete(h.sessions, token)
+			}
 		}
+		h.mu.Unlock()
 	}
-	if idx := len(ip) - 1; idx > 0 && ip[idx] == ':' {
-		return ip[:idx]
-	}
-	return ip
 }
 
-// writeJSON writes JSON response
-func writeJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
-}
-
-// logToFail2ban logs to fail2ban log file
 func (h *AuthHandler) logToFail2ban(message string) {
-	f, err := os.OpenFile(h.fail2banLog, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if h.fail2banLog == "" {
+		return
+	}
+
+	f, err := os.OpenFile(h.fail2banLog, os.O_APPEND|os.O_CREATE|os.O_WRONLY, fail2banLogPerm)
 	if err != nil {
 		log.Printf("Failed to open fail2ban log: %v", err)
 		return
 	}
 	defer f.Close()
 
-	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	logLine := fmt.Sprintf("%s %s\n", timestamp, message)
-	if _, err := f.WriteString(logLine); err != nil {
+	if _, err := fmt.Fprintf(f, "%s %s\n", time.Now().Format(time.DateTime), message); err != nil {
 		log.Printf("Failed to write to fail2ban log: %v", err)
 	}
+}
+
+func requestToken(r *http.Request) string {
+	if token := r.Header.Get("Authorization"); token != "" {
+		return token
+	}
+	return r.URL.Query().Get("token")
+}
+
+func generateToken() (string, error) {
+	buf := make([]byte, tokenBytes)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return host
+	}
+
+	if real := strings.TrimSpace(r.Header.Get("X-Real-IP")); real != "" {
+		return real
+	}
+
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		if i := strings.LastIndexByte(forwarded, ','); i >= 0 {
+			forwarded = forwarded[i+1:]
+		}
+		if last := strings.TrimSpace(forwarded); last != "" {
+			return last
+		}
+	}
+
+	return host
 }
